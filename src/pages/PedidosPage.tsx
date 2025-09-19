@@ -312,10 +312,10 @@ export function PedidosPage() {
               onChange={(e) => setFormPed((f) => ({ ...f, status: e.target.value as Status }))}
               className="w-full border rounded-lg px-3 py-2 bg-white"
             >
-              <option value="PAID">PAID</option>
-              <option value="PENDING">PENDING</option>
-              <option value="CANCELLED">CANCELLED</option>
-              <option value="REFUNDED">REFUNDED</option>
+              <option value="PAID">PAGO</option>
+              <option value="PENDING">PENDENTE</option>
+              <option value="CANCELLED">CANCELADO</option>
+              <option value="REFUNDED">REEMBOLSADO</option>
             </select>
           </div>
           <div className="md:col-span-2">
