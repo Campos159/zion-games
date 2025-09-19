@@ -8,10 +8,14 @@ class API {
   private token: string | null = null;
 
   constructor() {
+    const base =
+      // Se você quiser apontar direto para um backend, defina VITE_API_URL no Vercel.
+      import.meta.env.VITE_API_URL && !isDev
+        ? import.meta.env.VITE_API_URL
+        : "/api"; // Dev: proxy do Vite | Prod: rewrite do Vercel
+
     this.client = axios.create({
-      baseURL: isDev
-        ? "/api" // <- usa o proxy do Vite no dev
-        : (import.meta.env.VITE_API_URL || "https://SEU_BACKEND_PROD"),
+      baseURL: base,
       timeout: 15000,
     });
 
@@ -24,13 +28,25 @@ class API {
     });
   }
 
-  setToken(token: string | null) { this.token = token; }
+  setToken(token: string | null) {
+    this.token = token;
+  }
 
-  get<T>(url: string, cfg?: AxiosRequestConfig) { return this.client.get<T>(url, cfg); }
-  post<T>(url: string, data?: any, cfg?: AxiosRequestConfig) { return this.client.post<T>(url, data, cfg); }
-  put<T>(url: string, data?: any, cfg?: AxiosRequestConfig) { return this.client.put<T>(url, data, cfg); }
-  patch<T>(url: string, data?: any, cfg?: AxiosRequestConfig) { return this.client.patch<T>(url, data, cfg); }
-  delete<T>(url: string, cfg?: AxiosRequestConfig) { return this.client.delete<T>(url, cfg); }
+  get<T>(url: string, cfg?: AxiosRequestConfig) {
+    return this.client.get<T>(url, cfg);
+  }
+  post<T>(url: string, data?: any, cfg?: AxiosRequestConfig) {
+    return this.client.post<T>(url, data, cfg);
+  }
+  put<T>(url: string, data?: any, cfg?: AxiosRequestConfig) {
+    return this.client.put<T>(url, data, cfg);
+  }
+  patch<T>(url: string, data?: any, cfg?: AxiosRequestConfig) {
+    return this.client.patch<T>(url, data, cfg);
+  }
+  delete<T>(url: string, cfg?: AxiosRequestConfig) {
+    return this.client.delete<T>(url, cfg);
+  }
 }
 
 export const api = new API();

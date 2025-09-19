@@ -24,7 +24,8 @@ app = FastAPI(title="Zion Admin API", version="0.2")
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://zion-admin-beta.vercel.app",
+    "https://zion-admin-beta.vercel.app",  # seu front (Vercel)
+    "https://zion-games.onrender.com",     # seu backend (Render) - útil se chamar direto
 ]
 
 app.add_middleware(
@@ -34,6 +35,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def root():
+    return {"name": "Zion Admin API", "version": "0.2"}
 
 @app.get("/health")
 def health():
@@ -81,7 +86,7 @@ def _normalize_email_for_response(value) -> str:
     """
     Tenta manter o e-mail do jeito mais próximo possível do original,
     mas garantindo que passe na validação do EmailStr para não dar 422.
-    - remove 'mailto:' e espaços/comas
+    - remove 'mailto:' e espaços/comas/pontos-e-vírgula
     - converte '(at)', '[at]', ' at ' -> '@'
     - se faltar domínio com ponto, adiciona '.local'
     - se não houver '@', cai em 'no-reply@zion.local'
@@ -238,7 +243,6 @@ def listar_itens(pedido_id: int, db: Session = Depends(get_db)):
     out: list[schemas.ItemRead] = []
     for i in itens:
         total_item = float((i.quantidade or 0) * float(i.preco_unitario or 0))
-        enviado_em_str = _safe_datetime_str(i.enviado_em)
         s = schemas.ItemRead(
             id=i.id,
             pedido_id=i.pedido_id,
@@ -252,7 +256,7 @@ def listar_itens(pedido_id: int, db: Session = Depends(get_db)):
             nick_conta=i.nick_conta,
             codigo_ativacao=i.codigo_ativacao,
             enviado=bool(i.enviado),
-            enviado_em=enviado_em_str,
+            enviado_em=_safe_datetime_str(i.enviado_em),
             total_item=total_item,
         )
         out.append(s)
@@ -264,7 +268,6 @@ def criar_item(pedido_id: int, data: schemas.ItemCreate, db: Session = Depends(g
     if not it:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
     total_item = float((it.quantidade or 0) * float(it.preco_unitario or 0))
-    enviado_em_str = _safe_datetime_str(it.enviado_em)
     return schemas.ItemRead(
         id=it.id,
         pedido_id=it.pedido_id,
@@ -278,7 +281,7 @@ def criar_item(pedido_id: int, data: schemas.ItemCreate, db: Session = Depends(g
         nick_conta=it.nick_conta,
         codigo_ativacao=it.codigo_ativacao,
         enviado=bool(it.enviado),
-        enviado_em=enviado_em_str,
+        enviado_em=_safe_datetime_str(it.enviado_em),
         total_item=total_item,
     )
 
@@ -288,7 +291,6 @@ def atualizar_item(item_id: int, data: schemas.ItemUpdate, db: Session = Depends
     if not it:
         raise HTTPException(status_code=404, detail="Item não encontrado")
     total_item = float((it.quantidade or 0) * float(it.preco_unitario or 0))
-    enviado_em_str = _safe_datetime_str(it.enviado_em)
     return schemas.ItemRead(
         id=it.id,
         pedido_id=it.pedido_id,
@@ -302,7 +304,7 @@ def atualizar_item(item_id: int, data: schemas.ItemUpdate, db: Session = Depends
         nick_conta=it.nick_conta,
         codigo_ativacao=it.codigo_ativacao,
         enviado=bool(it.enviado),
-        enviado_em=enviado_em_str,
+        enviado_em=_safe_datetime_str(it.enviado_em),
         total_item=total_item,
     )
 
@@ -319,7 +321,6 @@ def toggle_enviado(item_id: int, db: Session = Depends(get_db)):
     if not it:
         raise HTTPException(status_code=404, detail="Item não encontrado")
     total_item = float((it.quantidade or 0) * float(it.preco_unitario or 0))
-    enviado_em_str = _safe_datetime_str(it.enviado_em)
     return schemas.ItemRead(
         id=it.id,
         pedido_id=it.pedido_id,
@@ -333,7 +334,7 @@ def toggle_enviado(item_id: int, db: Session = Depends(get_db)):
         nick_conta=it.nick_conta,
         codigo_ativacao=it.codigo_ativacao,
         enviado=bool(it.enviado),
-        enviado_em=enviado_em_str,
+        enviado_em=_safe_datetime_str(it.enviado_em),
         total_item=total_item,
     )
 
