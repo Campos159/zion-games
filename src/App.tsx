@@ -3,16 +3,22 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import { LoginPage } from "./modules/auth/LoginPage";
 import { ProtectedRoute } from "./modules/auth/ProtectedRoute";
 import { Layout } from "./components/Layout";
+
 import { JogosPage } from "./pages/JogosPage";
 import { ClientesPage } from "./pages/ClientesPage";
 import { PrecificacaoJogosPage } from "./pages/PrecificacaoJogosPage";
 import { VendasPage } from "./pages/VendasPage";
+import { PedidosPage } from "./pages/PedidosPage";
+import PedidosAgrupadosPage from "./pages/PedidosAgrupadosPage";
+
 
 function Home() {
   return (
     <div className="space-y-2">
       <h1 className="text-xl font-semibold">Bem-vindo(a) ao Zion Admin</h1>
-      <p className="text-slate-600 text-sm">Esta área será o painel (pendentes, usuários, etc.).</p>
+      <p className="text-slate-600 text-sm">
+        Esta área será o painel (pendentes, usuários, etc.).
+      </p>
     </div>
   );
 }
@@ -21,6 +27,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+
       <Route
         path="/"
         element={
@@ -34,7 +41,10 @@ export default function App() {
         <Route path="clientes" element={<ClientesPage />} />
         <Route path="precificacao" element={<PrecificacaoJogosPage />} />
         <Route path="vendas" element={<VendasPage />} />
+        <Route path="pedidos" element={<PedidosPage />} />
+        <Route path="pedidos/agrupados" element={<PedidosAgrupadosPage />} /> {/* NOVO */}
       </Route>
+
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

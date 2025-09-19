@@ -7,8 +7,17 @@ export function Layout() {
   const nav = useNavigate();
   const { user, logout } = useAuth();
 
-  const isActive = (path: string) =>
-    loc.pathname === path ? "bg-brand-50 text-brand-700 font-medium" : "hover:bg-slate-100";
+  // ativo quando a URL começa com o caminho informado (cobre subrotas)
+  const isActiveStartsWith = (path: string) =>
+    loc.pathname === path || loc.pathname.startsWith(path + "/")
+      ? "bg-brand-50 text-brand-700 font-medium"
+      : "hover:bg-slate-100";
+
+  // ativo apenas quando bate exatamente
+  const isActiveExact = (path: string) =>
+    loc.pathname === path
+      ? "bg-brand-50 text-brand-700 font-medium"
+      : "hover:bg-slate-100";
 
   return (
     <div className="min-h-screen flex">
@@ -22,37 +31,80 @@ export function Layout() {
         <nav className="flex-1 p-2">
           <ul className="space-y-1">
             <li>
-              <Link to="/" className={`block rounded px-3 py-2 text-sm ${isActive("/")}`}>
+              <Link
+                to="/"
+                className={`block rounded px-3 py-2 text-sm ${isActiveExact("/")}`}
+              >
                 Início
               </Link>
             </li>
+
             <li>
-              <Link to="/jogos" className={`block rounded px-3 py-2 text-sm ${isActive("/jogos")}`}>
+              <Link
+                to="/jogos"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/jogos")}`}
+              >
                 Jogos
               </Link>
             </li>
+
             <li>
-              <Link to="/clientes" className={`block rounded px-3 py-2 text-sm ${isActive("/clientes")}`}>
+              <Link
+                to="/clientes"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/clientes")}`}
+              >
                 Clientes
               </Link>
             </li>
+
             <li>
-              <Link to="/precificacao" className={`block rounded px-3 py-2 text-sm ${isActive("/precificacao")}`}>
+              <Link
+                to="/precificacao"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/precificacao")}`}
+              >
                 Precificação
               </Link>
             </li>
+
             <li>
-              <Link to="/vendas" className={`block rounded px-3 py-2 text-sm ${isActive("/vendas")}`}>
+              <Link
+                to="/vendas"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/vendas")}`}
+              >
                 Vendas
+              </Link>
+            </li>
+
+            <li>
+              <Link
+                to="/pedidos"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/pedidos")}`}
+              >
+                Pedidos
+              </Link>
+            </li>
+
+            {/* NOVO: link direto para a página de agrupados */}
+            <li>
+              <Link
+                to="/pedidos/agrupados"
+                className={`block rounded px-3 py-2 text-sm ${isActiveExact("/pedidos/agrupados")}`}
+              >
+                Pedidos Entregues
               </Link>
             </li>
           </ul>
         </nav>
 
         <div className="p-3 border-t text-sm">
-          <div className="mb-2">Logado como: <b>{user?.email}</b></div>
+          <div className="mb-2">
+            Logado como: <b>{user?.email}</b>
+          </div>
           <button
-            onClick={() => { logout(); nav("/login"); }}
+            onClick={() => {
+              logout();
+              nav("/login");
+            }}
             className="w-full rounded-lg bg-brand-600 text-white py-2 hover:bg-brand-700 transition"
           >
             Sair
@@ -65,7 +117,13 @@ export function Layout() {
         {/* Header mobile */}
         <header className="md:hidden sticky top-0 bg-white border-b p-3 flex justify-between">
           <div className="font-semibold text-slate-900">Zion Admin</div>
-          <button onClick={() => { logout(); nav("/login"); }} className="text-sm text-brand-600 hover:underline">
+          <button
+            onClick={() => {
+              logout();
+              nav("/login");
+            }}
+            className="text-sm text-brand-600 hover:underline"
+          >
             Sair
           </button>
         </header>
