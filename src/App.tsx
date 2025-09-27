@@ -10,7 +10,7 @@ import { PrecificacaoJogosPage } from "./pages/PrecificacaoJogosPage";
 import { VendasPage } from "./pages/VendasPage";
 import { PedidosPage } from "./pages/PedidosPage";
 import PedidosAgrupadosPage from "./pages/PedidosAgrupadosPage";
-
+import EnviosManuaisPage from "./pages/EnviosManuaisPage";
 
 function Home() {
   return (
@@ -42,7 +42,8 @@ export default function App() {
         <Route path="precificacao" element={<PrecificacaoJogosPage />} />
         <Route path="vendas" element={<VendasPage />} />
         <Route path="pedidos" element={<PedidosPage />} />
-        <Route path="pedidos/agrupados" element={<PedidosAgrupadosPage />} /> {/* NOVO */}
+        <Route path="pedidos/agrupados" element={<PedidosAgrupadosPage />} />
+        <Route path="envios-manuais" element={<EnviosManuaisPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,15 +1,17 @@
 # backend/main.py
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Any, Dict
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
-from . import schemas, crud
+from . import schemas, crud, emailer
 
 # ---------------------------------------------------------------------
 # DB boot
@@ -24,8 +26,7 @@ app = FastAPI(title="Zion Admin API", version="0.2")
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://zion-admin-beta.vercel.app",  # seu front (Vercel)
-    "https://zion-games.onrender.com",     # seu backend (Render) - útil se chamar direto
+    "https://zion-admin-beta.vercel.app",
 ]
 
 app.add_middleware(
@@ -36,16 +37,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"name": "Zion Admin API", "version": "0.2"}
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 # ---------------------------------------------------------------------
-# Helpers de saneamento (evitam 422)
+# Helpers (saneamento para evitar 422)
 # ---------------------------------------------------------------------
 def _safe_platform(value: str | None) -> schemas.Plataforma:
     allowed = {"PS4", "PS4s", "PS5", "PS5s"}
@@ -84,22 +81,13 @@ def _safe_datetime_str(v) -> str | None:
 
 def _normalize_email_for_response(value) -> str:
     """
-    Tenta manter o e-mail do jeito mais próximo possível do original,
-    mas garantindo que passe na validação do EmailStr para não dar 422.
-    - remove 'mailto:' e espaços/comas/pontos-e-vírgula
-    - converte '(at)', '[at]', ' at ' -> '@'
-    - se faltar domínio com ponto, adiciona '.local'
-    - se não houver '@', cai em 'no-reply@zion.local'
+    Normaliza e-mail para evitar 422 por formatos “soltos”.
     """
     if value is None:
         return "no-reply@zion.local"
     s = str(value).strip()
-
-    # remover prefixo mailto:
     if s.lower().startswith("mailto:"):
         s = s[7:].strip()
-
-    # normalizações comuns
     s = (
         s.replace("(at)", "@")
          .replace("[at]", "@")
@@ -108,34 +96,24 @@ def _normalize_email_for_response(value) -> str:
          .replace(",", "")
          .replace(";", "")
     )
-
-    # se não tem '@', não tem como salvar o original sem quebrar a validação
     if "@" not in s:
         return "no-reply@zion.local"
-
-    # garantir que o domínio tenha um ponto
     local, _, domain = s.rpartition("@")
     if "." not in domain:
         domain = domain + ".local"
-    s = f"{local}@{domain}"
-
-    return s
+    return f"{local}@{domain}"
 
 # =====================================================================
-# Coloque rotas estáticas antes das dinâmicas com {pedido_id}
+# Rotas estáticas antes de dinâmicas
 # =====================================================================
 
 # ---------------------------------------------------------------------
-# Pedidos agrupados (para a tela Pedidos Entregues)
+# Pedidos agrupados (tela "Pedidos Entregues")
 # ---------------------------------------------------------------------
 @app.get("/pedidos/agrupados", response_model=list[schemas.GrupoPedidosRead])
 def pedidos_agrupados_por_codigo(
     codigo: Optional[str] = None, db: Session = Depends(get_db)
 ):
-    """
-    IMPORTANTE: esta rota vem antes de /pedidos/{pedido_id} para evitar conflito
-    de path e erro 422 quando o literal 'agrupados' tenta ser parseado como int.
-    """
     grupos = crud.agrupar_pedidos_por_codigo(db, codigo)
 
     result: list[schemas.GrupoPedidosRead] = []
@@ -188,7 +166,6 @@ def pedidos_agrupados_por_codigo(
                 pedidos=pedidos_out,
             )
         )
-
     return result
 
 # ---------------------------------------------------------------------
@@ -348,3 +325,116 @@ def criar_venda(data: schemas.VendaCreate, db: Session = Depends(get_db)):
     it_out = schemas.ItemRead.model_validate(item)
     it_out.total_item = float((item.quantidade or 0) * float(item.preco_unitario or 0))
     return {"pedido": ped_out, "item": it_out}
+
+# ---------------------------------------------------------------------
+# Emails: enviar por ITEM e marcar como enviado
+# ---------------------------------------------------------------------
+class SendItemPayload(BaseModel):
+    """
+    Payload flexível para evitar 422:
+    - aceita strings para item_id;
+    - campos opcionais com defaults;
+    - permite 'extra' (ignora chaves desconhecidas vindas do front).
+    (OBS: mantido por compatibilidade, porém a rota abaixo lê JSON ou FormData
+    diretamente do Request e normaliza com _coerce_send_item_payload.)
+    """
+    model_config = ConfigDict(extra="allow")
+
+    item_id: int | str
+    destinatario: str
+    cliente_nome: str = ""
+    pedido_codigo: str | int | None = None
+    jogo: str = ""
+    template_tipo: str = "PS4_Primaria"
+    login: Optional[str] = ""
+    senha: Optional[str] = ""
+    codigo: Optional[str] = ""
+
+def _coerce_send_item_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza campos vindos de JSON ou FormData para o formato esperado."""
+    def pick(*keys):
+        for k in keys:
+            if k in raw and raw[k] is not None:
+                return raw[k]
+        return None
+
+    return {
+        "item_id": pick("item_id", "itemId", "id"),
+        "destinatario": pick("destinatario", "to", "email", "cliente_email"),
+        "cliente_nome": pick("cliente_nome", "clienteNome", "nome", "cliente") or "",
+        "pedido_codigo": pick("pedido_codigo", "pedidoCodigo", "codigo_pedido", "codigoPedido"),
+        "jogo": pick("jogo", "game", "nome_jogo") or "",
+        "template_tipo": pick("template_tipo", "templateTipo", "template") or "PS4_Primaria",
+        "login": pick("login", "email_conta", "usuario") or "",
+        "senha": pick("senha", "senha_conta", "password") or "",
+        "codigo": pick("codigo", "codigo_ativacao", "code") or "",
+    }
+
+@app.post("/emails/send-item")
+async def emails_send_item(request: Request, db: Session = Depends(get_db)):
+    """
+    Aceita tanto JSON (application/json) quanto FormData/x-www-form-urlencoded.
+    Normaliza os campos e envia e-mail + marca somente o item como enviado.
+    """
+    # 1) Lê payload independente do Content-Type
+    ct = (request.headers.get("content-type") or "").lower()
+    if ct.startswith("application/json"):
+        raw = await request.json()
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="JSON inválido.")
+    elif "multipart/form-data" in ct or "application/x-www-form-urlencoded" in ct:
+        form = await request.form()
+        raw = dict(form)
+    else:
+        # tenta JSON como fallback
+        try:
+            raw = await request.json()
+            if not isinstance(raw, dict):
+                raise ValueError()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Conteúdo inválido. Envie JSON ou FormData.")
+
+    payload = _coerce_send_item_payload(raw)
+
+    # 2) Converte/valida item_id
+    try:
+        item_id_int = int(str(payload["item_id"]).strip())
+    except Exception:
+        raise HTTPException(status_code=400, detail="item_id deve ser um inteiro válido")
+    if item_id_int <= 0:
+        raise HTTPException(status_code=400, detail="item_id deve ser > 0")
+
+    # 3) Normaliza e-mail do destinatário
+    to_email = _normalize_email_for_response(payload["destinatario"])
+    if not to_email or "@" not in to_email:
+        raise HTTPException(status_code=400, detail="destinatario inválido")
+
+    # 4) Monta e envia e-mail
+    try:
+        msg = emailer.montar_email_entrega_item(
+            destinatario=to_email,
+            cliente_nome=payload["cliente_nome"] or "",
+            pedido_codigo=payload["pedido_codigo"] or item_id_int,
+            jogo=payload["jogo"] or "",
+            template_tipo=payload["template_tipo"] or "PS4_Primaria",
+            login=payload["login"] or "",
+            senha=payload["senha"] or "",
+            codigo=payload["codigo"] or "",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao montar e-mail: {e}")
+
+    result = emailer.send_email(msg)
+
+    # 5) Marca somente o item como enviado
+    upd = schemas.ItemUpdate(enviado=True, enviado_em=datetime.utcnow())
+    it = crud.atualizar_item(db, item_id_int, upd)
+    if not it:
+        raise HTTPException(status_code=404, detail="Item não encontrado para marcar como enviado")
+
+    return {
+        "ok": True,
+        "email": result,
+        "item_id": it.id,
+        "enviado_em": _safe_datetime_str(it.enviado_em),
+    }

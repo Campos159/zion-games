@@ -84,13 +84,22 @@ export function Layout() {
               </Link>
             </li>
 
-            {/* NOVO: link direto para a página de agrupados */}
             <li>
               <Link
                 to="/pedidos/agrupados"
                 className={`block rounded px-3 py-2 text-sm ${isActiveExact("/pedidos/agrupados")}`}
               >
                 Pedidos Entregues
+              </Link>
+            </li>
+
+            {/* NOVO: link para a página de envios manuais */}
+            <li>
+              <Link
+                to="/envios-manuais"
+                className={`block rounded px-3 py-2 text-sm ${isActiveExact("/envios-manuais")}`}
+              >
+                Envios Manuais
               </Link>
             </li>
           </ul>

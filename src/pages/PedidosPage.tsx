@@ -7,7 +7,44 @@ import {
   type ItemRead, type ItemCreate, type ItemUpdate, type Plataforma, type Status
 } from "../services/pedidos";
 
-/** === helpers UI === */
+// Helpers e tipos exportados da tela de Jogos (para validar SKUs e ajustar estoque)
+import {
+  findJogoBySku,
+  normalizeSku,
+  getJogosFromStorage,
+  JOGOS_STORAGE_KEY,
+  type Jogo
+} from "./JogosPage";
+
+/* ======================================================
+   Helpers estoque de jogos
+   ====================================================== */
+function salvarJogos(lista: Jogo[]) {
+  localStorage.setItem(JOGOS_STORAGE_KEY, JSON.stringify(lista));
+  // Notifica outras telas para recarregar (Clientes/Jogos)
+  window.dispatchEvent(new CustomEvent("zion:jogos-updated"));
+}
+
+/** Altera o estoque do jogo associado ao SKU em `qtdDelta` (pode ser negativo). */
+function atualizarEstoque(sku: string, qtdDelta: number) {
+  const lista = getJogosFromStorage();
+  const match = findJogoBySku(sku);
+  if (!match) return;
+
+  const { jogo, plataforma } = match;
+  const idx = lista.findIndex((j) => j.id === jogo.id);
+  if (idx >= 0) {
+    const novo = { ...lista[idx] };
+    // garante que não fique negativo
+    (novo as any)[plataforma] = Math.max(0, Number((novo as any)[plataforma] || 0) + qtdDelta);
+    lista[idx] = novo;
+    salvarJogos(lista);
+  }
+}
+
+/* ======================================================
+   Helpers UI
+   ====================================================== */
 const fmtBRL = (n: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n || 0);
 
@@ -20,6 +57,79 @@ function formatTelefone(v: string) {
   return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
 }
 
+/* ======================================================
+   Clientes LocalStorage
+   ====================================================== */
+type ClienteLS = {
+  id: string;
+  cod: number;
+  nome: string;
+  telefone: string;
+  data: string;
+  email: string;
+};
+const CLIENTES_KEY = "zion.clientes";
+
+function uid() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+function loadClientesLS(): ClienteLS[] {
+  try {
+    const raw = localStorage.getItem(CLIENTES_KEY);
+    return raw ? (JSON.parse(raw) as ClienteLS[]) : [];
+  } catch {
+    return [];
+  }
+}
+function saveClientesLS(lista: ClienteLS[]) {
+  localStorage.setItem(CLIENTES_KEY, JSON.stringify(lista));
+  window.dispatchEvent(new Event("zion.clientes:refresh"));
+}
+function recomputarCodClientes(lista: ClienteLS[]): ClienteLS[] {
+  const ord = [...lista].sort((a, b) =>
+    a.nome.localeCompare(b.nome, "pt-BR", { sensitivity: "base" })
+  );
+  return ord.map((c, i) => ({ ...c, cod: i + 1 }));
+}
+/** Insere/atualiza cliente do pedido no localStorage */
+function upsertClienteFromPedido(p: PedidoRead | (PedidoCreate & { id?: number })) {
+  const nome = (p as any).cliente_nome?.trim() || "";
+  const email = ((p as any).cliente_email || "").trim();
+  const telefone = formatTelefone((p as any).telefone || "");
+  const data = (p as any).data_criacao || new Date().toISOString().slice(0, 10);
+
+  if (!nome && !email && !telefone) return;
+
+  const lista = loadClientesLS();
+  const ix = lista.findIndex((c) =>
+    email
+      ? c.email?.toLowerCase() === email.toLowerCase()
+      : c.nome === nome && soDigitos(c.telefone) === soDigitos(telefone)
+  );
+
+  if (ix >= 0) {
+    const atual = lista[ix];
+    const novo: ClienteLS = {
+      ...atual,
+      nome: nome || atual.nome,
+      email: email || atual.email,
+      telefone: telefone || atual.telefone,
+      data: data || atual.data,
+    };
+    const recomputada = recomputarCodClientes(
+      lista.map((c, i) => (i === ix ? novo : c))
+    );
+    saveClientesLS(recomputada);
+  } else {
+    const novo: ClienteLS = { id: uid(), cod: 0, nome, email, telefone, data };
+    const recomputada = recomputarCodClientes([...lista, novo]);
+    saveClientesLS(recomputada);
+  }
+}
+
+/* ======================================================
+   Componente principal
+   ====================================================== */
 export function PedidosPage() {
   /** ======= Estados ======= */
   const [carregando, setCarregando] = useState(true);
@@ -101,7 +211,7 @@ export function PedidosPage() {
 
   /** ======= Filtro: SOMENTE não enviados (em separação) ======= */
   const pedidosView = useMemo(() => {
-    const base = pedidos.filter(p => !p.enviado); // <<< aqui filtramos
+    const base = pedidos.filter(p => !p.enviado);
     const q = busca.trim().toLowerCase();
     if (!q) return base;
     return base.filter((p) =>
@@ -124,6 +234,9 @@ export function PedidosPage() {
 
     const novo = await criarPedido(payload);
     setPedidos((lst) => [novo, ...lst]);
+
+    // grava cliente no localStorage (Clientes)
+    upsertClienteFromPedido(novo);
 
     // carrega total do novo pedido (zero a princípio)
     setTotais((m) => ({ ...m, [novo.id]: 0 }));
@@ -148,6 +261,7 @@ export function PedidosPage() {
       return rest;
     });
     if (selId === id) { setSelId(null); setItens([]); }
+    // não removemos o cliente automaticamente
   }
 
   function iniciarEdicaoPedido(p: PedidoRead) {
@@ -172,6 +286,10 @@ export function PedidosPage() {
       telefone: editPed.telefone ? formatTelefone(editPed.telefone) : undefined,
     });
     setPedidos((lst) => lst.map((p) => (p.id === editingPedId ? upd : p)));
+
+    // atualiza/insere cliente no localStorage
+    upsertClienteFromPedido(upd);
+
     // recarrega total desse pedido
     try {
       const t = await totalDoPedido(editingPedId);
@@ -190,8 +308,39 @@ export function PedidosPage() {
     }
     if (!formItem.nome_produto.trim() || formItem.quantidade < 1) return;
 
-    const it = await criarItem(selId, formItem);
+    // valida SKU e disponibilidade
+    const sku = normalizeSku(formItem.sku || "");
+    const match = findJogoBySku(sku);
+    if (!sku || !match) {
+      alert("SKU informado não existe na tabela de Jogos. Cadastre o jogo ou corrija o SKU.");
+      return;
+    }
+    const disponivel = Number((match.jogo as any)[match.plataforma] || 0);
+    if (disponivel < formItem.quantidade) {
+      alert(`Estoque insuficiente. Disponível: ${disponivel}`);
+      return;
+    }
+
+    // ajusta nome e plataforma automaticamente (mantém nome se já preenchido)
+    const plataformaMap: Record<"ps4"|"ps5"|"ps4s"|"ps5s", Plataforma> = {
+      ps4: "PS4",
+      ps5: "PS5",
+      ps4s: "PS4s",
+      ps5s: "PS5s",
+    };
+
+    const payload: ItemCreate = {
+      ...formItem,
+      sku,
+      nome_produto: formItem.nome_produto || match.jogo.jogo,
+      plataforma: plataformaMap[match.plataforma],
+    };
+
+    const it = await criarItem(selId, payload);
     setItens((lst) => [...lst, it]);
+
+    // desconta estoque
+    atualizarEstoque(sku, -formItem.quantidade);
 
     // recarrega lista de pedidos para refletir 'enviado' derivado
     const lst = await listarPedidos();
@@ -229,7 +378,74 @@ export function PedidosPage() {
   }
   async function salvarEdicaoItem() {
     if (!editingItemId || !editItem) return;
-    const it = await atualizarItem(editingItemId, editItem);
+
+    let payload: ItemUpdate = { ...editItem };
+
+    // valida/ajusta se SKU foi alterado
+    if (typeof payload.sku === "string") {
+      const sku = normalizeSku(payload.sku);
+      const match = findJogoBySku(sku);
+      if (!sku || !match) {
+        alert("SKU informado não existe na tabela de Jogos. Cadastre o jogo ou corrija o SKU.");
+        return;
+      }
+      payload.sku = sku;
+
+      // se nome estiver vazio, preenche com o do jogo
+      if (!payload.nome_produto) {
+        payload.nome_produto = match.jogo.jogo;
+      }
+      // garante plataforma coerente com o SKU
+      const plataformaMap: Record<"ps4"|"ps5"|"ps4s"|"ps5s", Plataforma> = {
+        ps4: "PS4",
+        ps5: "PS5",
+        ps4s: "PS4s",
+        ps5s: "PS5s",
+      };
+      payload.plataforma = plataformaMap[match.plataforma];
+    }
+
+    // item antigo para ajustar estoque pela diferença
+    const antigo = itens.find((x) => x.id === editingItemId);
+
+    // se mudou SKU, devolve quantidade do antigo e reserva no novo
+    if (antigo && typeof payload.sku === "string" && payload.sku !== (antigo.sku || "")) {
+      // devolve do antigo
+      if (antigo.sku && antigo.quantidade) atualizarEstoque(antigo.sku, +antigo.quantidade);
+
+      // verifica disponibilidade no novo
+      const novoMatch = findJogoBySku(payload.sku as string);
+      const disponivelNovo = novoMatch ? Number((novoMatch.jogo as any)[novoMatch.plataforma] || 0) : 0;
+      const qtdNova = Number(payload.quantidade ?? antigo.quantidade ?? 0);
+      if (disponivelNovo < qtdNova) {
+        alert(`Estoque insuficiente no jogo do novo SKU. Disponível: ${disponivelNovo}`);
+        // reverte devolução do antigo (para não perder reserva)
+        if (antigo.sku && antigo.quantidade) atualizarEstoque(antigo.sku, -antigo.quantidade);
+        return;
+      }
+      // reserva no novo SKU
+      atualizarEstoque(payload.sku as string, -qtdNova);
+    } else if (antigo && payload.quantidade != null) {
+      // mesmo SKU: ajusta pela diferença de quantidade
+      const diff = Number(payload.quantidade) - Number(antigo.quantidade || 0);
+      if (diff !== 0 && antigo.sku) {
+        // se aumentou, precisa ter estoque; se diminuiu, devolve
+        if (diff > 0) {
+          const match = findJogoBySku(antigo.sku);
+          const disponivel = match ? Number((match.jogo as any)[match.plataforma] || 0) : 0;
+          if (disponivel < diff) {
+            alert(`Estoque insuficiente. Disponível: ${disponivel}`);
+            return;
+          }
+          atualizarEstoque(antigo.sku, -diff);
+        } else {
+          // diff < 0, devolve
+          atualizarEstoque(antigo.sku, -diff); // (-negativo) vira positivo
+        }
+      }
+    }
+
+    const it = await atualizarItem(editingItemId, payload);
     setItens((lst) => lst.map((x) => (x.id === editingItemId ? it : x)));
 
     // recarrega pedidos e total do selecionado (regra derivada)
@@ -245,8 +461,15 @@ export function PedidosPage() {
 
   async function onExcluirItem(id: number, pedidoId: number) {
     if (!confirm("Confirma excluir este item?")) return;
+    const antigo = itens.find((x) => x.id === id);
+
     await excluirItem(id);
     setItens((lst) => lst.filter((x) => x.id !== id));
+
+    // devolve estoque do item removido
+    if (antigo?.sku && antigo.quantidade) {
+      atualizarEstoque(antigo.sku, +antigo.quantidade);
+    }
 
     // refletir status do pedido e total
     const lstPed = await listarPedidos();
@@ -259,7 +482,7 @@ export function PedidosPage() {
     const novo = await toggleEnviado(i.id);
     setItens((lst) => lst.map((x) => (x.id === i.id ? novo : x)));
 
-    // recarrega pedidos e total
+    // toggle de enviado NÃO mexe em estoque (já foi reservado na criação/edição)
     const lst = await listarPedidos();
     setPedidos(lst);
     if (selId != null) {
@@ -566,7 +789,24 @@ export function PedidosPage() {
           <input
             placeholder="SKU"
             value={formItem.sku || ""}
-            onChange={(e) => setFormItem((f) => ({ ...f, sku: e.target.value }))}
+            onChange={(e) => {
+              const sku = normalizeSku(e.target.value);
+              // tenta auto-preencher nome/plataforma quando bater um SKU válido
+              const match = findJogoBySku(sku);
+              if (match) {
+                const plataMap: Record<"ps4"|"ps5"|"ps4s"|"ps5s", Plataforma> = {
+                  ps4: "PS4", ps5: "PS5", ps4s: "PS4s", ps5s: "PS5s"
+                };
+                setFormItem((f) => ({
+                  ...f,
+                  sku,
+                  nome_produto: f.nome_produto || match.jogo.jogo,
+                  plataforma: plataMap[match.plataforma],
+                }));
+              } else {
+                setFormItem((f) => ({ ...f, sku }));
+              }
+            }}
             className="border rounded-lg px-3 py-2"
           />
           <input
@@ -642,7 +882,23 @@ export function PedidosPage() {
                       {emEdicao ? (
                         <input
                           value={editItem?.sku ?? i.sku ?? ""}
-                          onChange={(e) => setEditItem((x) => ({ ...(x || {}), sku: e.target.value }))}
+                          onChange={(e) => {
+                            const sku = normalizeSku(e.target.value);
+                            const match = findJogoBySku(sku);
+                            if (match) {
+                              const plataMap: Record<"ps4"|"ps5"|"ps4s"|"ps5s", Plataforma> = {
+                                ps4: "PS4", ps5: "PS5", ps4s: "PS4s", ps5s: "PS5s"
+                              };
+                              setEditItem((x) => ({
+                                ...(x || {}),
+                                sku,
+                                nome_produto: (x?.nome_produto ?? i.nome_produto) || match.jogo.jogo,
+                                plataforma: plataMap[match.plataforma],
+                              }));
+                            } else {
+                              setEditItem((x) => ({ ...(x || {}), sku }));
+                            }
+                          }}
                           className="border rounded px-2 py-1 w-32"
                         />
                       ) : (i.sku || "—")}

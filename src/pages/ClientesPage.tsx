@@ -1,5 +1,11 @@
 // src/pages/ClientesPage.tsx
 import { useEffect, useMemo, useState } from "react";
+import {
+  listarPedidos,
+  listarItens,
+  type PedidoRead,
+  type ItemRead,
+} from "../services/pedidos";
 
 export type Cliente = {
   id: string;
@@ -54,6 +60,13 @@ function formatTelefone(v: string) {
   return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
 }
 
+type Compra = {
+  pedidoId: number;
+  pedidoCodigo?: string | null;
+  dataPedido: string; // yyyy-mm-dd
+  item: ItemRead;
+};
+
 export function ClientesPage() {
   const [lista, setLista] = useState<Cliente[]>(() => carregar());
   const [busca, setBusca] = useState("");
@@ -70,6 +83,23 @@ export function ClientesPage() {
   const [editRow, setEditRow] = useState<Omit<Cliente, "cod"> | null>(null);
 
   useEffect(() => salvar(lista), [lista]);
+
+  // escuta refresh de outras telas e o evento 'storage'
+  useEffect(() => {
+    const refresh = () => setLista(carregar());
+
+    window.addEventListener("zion.clientes:refresh", refresh);
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY) refresh();
+    };
+    window.addEventListener("storage", onStorage);
+
+    return () => {
+      window.removeEventListener("zion.clientes:refresh", refresh);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
 
   const filtrada = useMemo(() => {
     const q = busca.trim().toLowerCase();
@@ -148,6 +178,76 @@ export function ClientesPage() {
   function onChangeTelefoneEdit(e: React.ChangeEvent<HTMLInputElement>) {
     const value = formatTelefone(e.target.value);
     setEditRow((r) => (r ? { ...r, telefone: value } : r));
+  }
+
+  // ========= HISTÓRICO (MODAL) =========
+  const [historicoOpen, setHistoricoOpen] = useState(false);
+  const [clienteSel, setClienteSel] = useState<Cliente | null>(null);
+  const [compras, setCompras] = useState<Compra[]>([]);
+  const [loadingCompras, setLoadingCompras] = useState(false);
+  const [erroCompras, setErroCompras] = useState<string | null>(null);
+  const [itemAbertoId, setItemAbertoId] = useState<number | null>(null);
+
+  function normalizaEmail(s: string) {
+    return (s || "").trim().toLowerCase();
+  }
+
+  async function abrirHistorico(c: Cliente) {
+    setClienteSel(c);
+    setHistoricoOpen(true);
+    setCompras([]);
+    setErroCompras(null);
+    setItemAbertoId(null);
+
+    try {
+      setLoadingCompras(true);
+      const allPedidos: PedidoRead[] = await listarPedidos();
+
+      const alvoEmail = normalizaEmail(c.email);
+      const alvoNome = (c.nome || "").trim().toLowerCase();
+
+      const pedidosDoCliente = allPedidos.filter((p) => {
+        const pe = normalizaEmail(p.cliente_email || "");
+        const pn = (p.cliente_nome || "").trim().toLowerCase();
+
+        // prioridade: e-mail; fallback: nome (quando não houver e-mail salvo)
+        return (alvoEmail && pe === alvoEmail) || (!alvoEmail && pn === alvoNome);
+      });
+
+      // Busca itens de cada pedido
+      const entradas: Compra[] = [];
+      for (const p of pedidosDoCliente) {
+        const items = await listarItens(p.id);
+        for (const it of items) {
+          entradas.push({
+            pedidoId: p.id,
+            pedidoCodigo: p.codigo ?? null,
+            dataPedido: p.data_criacao,
+            item: it,
+          });
+        }
+      }
+
+      // ordena por data do pedido (desc) e depois pelo id do item
+      entradas.sort((a, b) => {
+        if (a.dataPedido === b.dataPedido) return a.item.id - b.item.id;
+        return a.dataPedido < b.dataPedido ? 1 : -1;
+      });
+
+      setCompras(entradas);
+    } catch (e: any) {
+      setErroCompras("Falha ao carregar histórico do cliente.");
+    } finally {
+      setLoadingCompras(false);
+    }
+  }
+
+  function fecharHistorico() {
+    setHistoricoOpen(false);
+    setClienteSel(null);
+    setCompras([]);
+    setItemAbertoId(null);
+    setErroCompras(null);
   }
 
   return (
@@ -321,6 +421,12 @@ export function ClientesPage() {
                     {!emEdicao ? (
                       <div className="flex gap-3 justify-end">
                         <button
+                          onClick={() => abrirHistorico(c)}
+                          className="text-brand-700 hover:underline"
+                        >
+                          Histórico
+                        </button>
+                        <button
                           onClick={() => iniciarEdicao(c)}
                           className="text-brand-700 hover:underline"
                         >
@@ -357,6 +463,109 @@ export function ClientesPage() {
           </tbody>
         </table>
       </div>
+
+      {/* ===== Modal Histórico ===== */}
+      {historicoOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          {/* backdrop */}
+          <div
+            className="absolute inset-0 bg-black/40"
+            onClick={fecharHistorico}
+          />
+          {/* card */}
+          <div className="relative bg-white rounded-2xl shadow-xl border border-slate-200 w-[95vw] max-w-4xl max-h-[85vh] overflow-hidden">
+            <div className="p-4 border-b flex items-center justify-between">
+              <div>
+                <h3 className="font-semibold text-slate-900">
+                  Histórico de compras — {clienteSel?.nome}
+                </h3>
+                <p className="text-sm text-slate-600">
+                  {clienteSel?.email || "sem e-mail"} • {clienteSel?.telefone || "sem telefone"}
+                </p>
+              </div>
+              <button
+                onClick={fecharHistorico}
+                className="rounded-lg border px-3 py-1.5 text-sm hover:bg-slate-50"
+              >
+                Fechar
+              </button>
+            </div>
+
+            <div className="p-4 overflow-auto max-h-[70vh]">
+              {loadingCompras && (
+                <div className="text-sm text-slate-600">Carregando histórico…</div>
+              )}
+
+              {erroCompras && (
+                <div className="text-sm text-red-600">{erroCompras}</div>
+              )}
+
+              {!loadingCompras && !erroCompras && compras.length === 0 && (
+                <div className="text-sm text-slate-600">Nenhum jogo encontrado para este cliente.</div>
+              )}
+
+              {!loadingCompras && compras.length > 0 && (
+                <div className="space-y-2">
+                  {compras.map((c) => {
+                    const aberto = itemAbertoId === c.item.id;
+                    return (
+                      <div key={`${c.pedidoId}-${c.item.id}`} className="border rounded-lg">
+                        <button
+                          onClick={() => setItemAbertoId((id) => (id === c.item.id ? null : c.item.id))}
+                          className="w-full text-left px-3 py-2 flex items-center justify-between hover:bg-slate-50"
+                        >
+                          <div className="flex flex-col">
+                            <span className="font-medium text-slate-900">
+                              {c.item.nome_produto} <span className="text-slate-500">({c.item.plataforma})</span>
+                            </span>
+                            <span className="text-xs text-slate-600">
+                              Pedido #{c.pedidoCodigo || c.pedidoId} • {c.dataPedido}
+                            </span>
+                          </div>
+                          <span className="text-xs text-slate-600">
+                            {aberto ? "Ocultar" : "Ver detalhes"}
+                          </span>
+                        </button>
+
+                        {aberto && (
+                          <div className="px-3 pb-3">
+                            <div className="grid sm:grid-cols-2 gap-3 text-sm">
+                              <div>
+                                <div className="text-slate-500">E-mail/Usuário</div>
+                                <div className="font-medium break-all">{c.item.email_conta || "—"}</div>
+                              </div>
+                              <div>
+                                <div className="text-slate-500">Senha</div>
+                                <div className="font-medium">{c.item.senha_conta || "—"}</div>
+                              </div>
+                              <div>
+                                <div className="text-slate-500">Nick</div>
+                                <div className="font-medium">{c.item.nick_conta || "—"}</div>
+                              </div>
+                              <div>
+                                <div className="text-slate-500">Código de ativação</div>
+                                <div className="font-medium">{c.item.codigo_ativacao || "—"}</div>
+                              </div>
+                              <div>
+                                <div className="text-slate-500">Quantidade</div>
+                                <div className="font-medium">{c.item.quantidade}</div>
+                              </div>
+                              <div>
+                                <div className="text-slate-500">Enviado</div>
+                                <div className="font-medium">{c.item.enviado ? "Sim" : "Não"}</div>
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
