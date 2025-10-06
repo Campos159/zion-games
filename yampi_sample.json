@@ -1,0 +1,20 @@
+{
+  "event": "order.paid",
+  "order": {
+    "id": 12345,
+    "code": "YAMPI-TESTE-001",
+    "status": "paid",
+    "customer": {
+      "name": "Cliente Teste",
+      "email": "cliente@teste.com",
+      "phone": "+55 (11) 98888-7777"
+    },
+    "items": [
+      {
+        "sku": "XS826T5KM",
+        "quantity": 1,
+        "price": 199.9
+      }
+    ]
+  }
+}

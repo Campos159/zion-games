@@ -1,5 +1,5 @@
 // src/pages/JogosPage.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 /* ============================================================
    Tipos e constantes
@@ -11,7 +11,13 @@ export type ContaJogo = {
   email: string;
   nick: string;
   senha: string;
-  ativacao: string;
+
+  /** NOVO: lista de códigos de ativação, 1 por item */
+  ativacoes: string[];
+
+  /** LEGADO: ainda lido na migração; não mais usado na UI */
+  ativacao?: string;
+
   midia: Midia; // PRIMARIA | SECUNDARIA
 };
 
@@ -31,13 +37,16 @@ export type Jogo = {
   // coleção de contas por jogo
   contas?: ContaJogo[];
 
-  // SKUs por slot
+  // SKUs por slot (para localizar o jogo via SKU)
   sku_ps4?: string;
   sku_ps5?: string;
   sku_ps4s?: string;
   sku_ps5s?: string;
 
-  // LEGADO: mantidos apenas para migração/criação inicial
+  /** LEGADO: pool único de códigos por jogo — apenas para migração se existir */
+  codes?: string[];
+
+  // LEGADO (criação rápida de primeira conta)
   email?: string;
   nick?: string;
   senha?: string;
@@ -70,7 +79,22 @@ function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-/** Lê e migra jogos do localStorage (inclui migração para `contas`) */
+/** Converte texto em lista de códigos. Preferência: 1 por linha, mas aceita vírgula/;/. */
+function splitCodes(text?: string | string[]): string[] {
+  if (!text) return [];
+  if (Array.isArray(text)) {
+    return text.map(String).map((s) => s.trim()).filter(Boolean);
+  }
+  return String(text)
+    .split(/\r?\n|,|;|\//g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+function joinCodes(arr?: string[]): string {
+  return (arr || []).join("\n");
+}
+
+/** Lê e migra jogos do localStorage */
 export function getJogosFromStorage(): Jogo[] {
   try {
     const raw = localStorage.getItem(JOGOS_STORAGE_KEY);
@@ -78,7 +102,6 @@ export function getJogosFromStorage(): Jogo[] {
     const parsed = JSON.parse(raw) as any[];
 
     const migrada = parsed.map((j: any) => {
-      // migração de quantidades e skus
       const base: Jogo = {
         ...j,
         ps4: typeof j.ps4 === "boolean" ? (j.ps4 ? 1 : 0) : Number(j.ps4 || 0),
@@ -92,38 +115,49 @@ export function getJogosFromStorage(): Jogo[] {
         sku_ps5s: normalizeSku(j.sku_ps5s),
       };
 
-      // migração das credenciais legadas (email/nick/senha/ativacao) para contas[0]
+      // MIGRAÇÃO: contas -> garantir ativacoes[]
       const jaTemContas = Array.isArray(j.contas);
-      const temLegado =
-        (j.email && String(j.email).trim()) ||
-        (j.nick && String(j.nick).trim()) ||
-        (j.senha && String(j.senha).trim()) ||
-        (j.ativacao && String(j.ativacao).trim());
+      if (jaTemContas) {
+        (base as any).contas = (j.contas as any[]).map((c: any) => {
+          const listaAtiv = Array.isArray(c.ativacoes)
+            ? splitCodes(c.ativacoes)
+            : splitCodes(c.ativacao);
+          return {
+            id: c.id || uid(),
+            email: String(c.email || ""),
+            nick: String(c.nick || ""),
+            senha: String(c.senha || ""),
+            ativacoes: listaAtiv,
+            ativacao: undefined, // legado não mais usado
+            midia: (c.midia === "PRIMARIA" || c.midia === "SECUNDARIA") ? c.midia : "PRIMARIA",
+          } as ContaJogo;
+        });
+      } else {
+        // Se vierem campos legados soltos, cria a primeira conta
+        const temLegado =
+          (j.email && String(j.email).trim()) ||
+          (j.nick && String(j.nick).trim()) ||
+          (j.senha && String(j.senha).trim()) ||
+          (j.ativacao && String(j.ativacao).trim());
+        if (temLegado) {
+          (base as any).contas = [{
+            id: uid(),
+            email: String(j.email || ""),
+            nick: String(j.nick || ""),
+            senha: String(j.senha || ""),
+            ativacoes: splitCodes(j.ativacao),
+            ativacao: undefined,
+            midia:
+              (Number(j.ps4 || 0) + Number(j.ps5 || 0)) >= (Number(j.ps4s || 0) + Number(j.ps5s || 0))
+                ? "PRIMARIA"
+                : "SECUNDARIA",
+          } as ContaJogo];
+        }
+      }
 
-      if (!jaTemContas && temLegado) {
-        const conta: ContaJogo = {
-          id: uid(),
-          email: String(j.email || ""),
-          nick: String(j.nick || ""),
-          senha: String(j.senha || ""),
-          ativacao: String(j.ativacao || ""),
-          // heurística simples para midia inicial
-          midia:
-            (Number(j.ps4 || 0) + Number(j.ps5 || 0)) >= (Number(j.ps4s || 0) + Number(j.ps5s || 0))
-              ? "PRIMARIA"
-              : "SECUNDARIA",
-        };
-        (base as any).contas = [conta];
-      } else if (jaTemContas) {
-        // normaliza estrutura das contas
-        (base as any).contas = (j.contas as any[]).map((c: any) => ({
-          id: c.id || uid(),
-          email: String(c.email || ""),
-          nick: String(c.nick || ""),
-          senha: String(c.senha || ""),
-          ativacao: String(c.ativacao || ""),
-          midia: (c.midia === "PRIMARIA" || c.midia === "SECUNDARIA") ? c.midia : "PRIMARIA",
-        })) as ContaJogo[];
+      // LEGADO: se houver um `codes` por jogo, apenas mantemos para referência (não é mais usado)
+      if (Array.isArray(j.codes)) {
+        (base as any).codes = splitCodes(j.codes);
       }
 
       return base;
@@ -138,12 +172,11 @@ export function getJogosFromStorage(): Jogo[] {
 /** Persiste lista e avisa quem estiver ouvindo. */
 export function setJogosToStorage(lista: Jogo[]) {
   localStorage.setItem(JOGOS_STORAGE_KEY, JSON.stringify(lista));
-  // dois eventos por compatibilidade com versões anteriores
   try { window.dispatchEvent(new CustomEvent("zion:jogos-updated")); } catch {}
   try { window.dispatchEvent(new Event("zion.jogos:refresh")); } catch {}
 }
 
-/** Procura por um SKU em qualquer coluna. */
+/** Procura por um SKU em qualquer coluna */
 export function findJogoBySku(
   skuRaw: string
 ): { jogo: Jogo; plataforma: PlataformaKey } | null {
@@ -164,6 +197,76 @@ export function skuExists(skuRaw: string): boolean {
   return !!findJogoBySku(skuRaw);
 }
 
+/* ======== NOVOS HELPERS EXPORTADOS — códigos por CONTA ======== */
+
+/** Encontra a CONTA de um jogo a partir do SKU + Mídia (útil para outra tela) */
+export function findContaBySkuAndMidia(skuRaw: string, midia: Midia): { jogo: Jogo; conta: ContaJogo } | null {
+  const hit = findJogoBySku(skuRaw);
+  if (!hit) return null;
+  const contas = hit.jogo.contas || [];
+  const conta = contas.find(c => c.midia === midia) || contas[0]; // fallback se só houver uma
+  return conta ? { jogo: hit.jogo, conta } : null;
+}
+
+/** Pré-visualiza o PRÓXIMO código disponível por CONTA (sem consumir) */
+export function previewNextCodeForAccount(contaId: string): string | undefined {
+  const lista = getJogosFromStorage();
+  for (const j of lista) {
+    const conta = (j.contas || []).find(c => c.id === contaId);
+    if (conta) return (conta.ativacoes || [])[0];
+  }
+  return undefined;
+}
+
+/** Consome (remove) o PRÓXIMO código por CONTA e retorna o valor */
+export function consumeNextCodeForAccount(contaId: string): string | undefined {
+  const lista = getJogosFromStorage();
+  for (let i = 0; i < lista.length; i++) {
+    const j = lista[i];
+    const idx = (j.contas || []).findIndex(c => c.id === contaId);
+    if (idx >= 0) {
+      const conta = (j.contas || [])[idx];
+      const pool = conta.ativacoes || [];
+      if (!pool.length) return undefined;
+      const code = pool[0];
+      const novaConta: ContaJogo = { ...conta, ativacoes: pool.slice(1) };
+      const novoJogo: Jogo = {
+        ...j,
+        contas: (j.contas || []).map((c, k) => (k === idx ? novaConta : c)),
+      };
+      const novaLista = recomputarCod([
+        ...lista.slice(0, i), novoJogo, ...lista.slice(i + 1),
+      ]);
+      setJogosToStorage(novaLista);
+      return code;
+    }
+  }
+  return undefined;
+}
+
+/** Helpers por SKU + Mídia */
+export function previewNextCodeBySkuAndMidia(skuRaw: string, midia: Midia): string | undefined {
+  const hit = findContaBySkuAndMidia(skuRaw, midia);
+  if (!hit) return undefined;
+  return (hit.conta.ativacoes || [])[0];
+}
+export function consumeNextCodeBySkuAndMidia(skuRaw: string, midia: Midia): string | undefined {
+  const hit = findContaBySkuAndMidia(skuRaw, midia);
+  if (!hit) return undefined;
+  return consumeNextCodeForAccount(hit.conta.id);
+}
+
+/* ======== HELPER DE CONTAGEM SOLICITADO ======== */
+/** Conta quantas CONTAS são válidas (email + senha + pelo menos 1 código) */
+function contasValidas(j: Jogo): number {
+  const contas = j.contas || [];
+  return contas.filter(c =>
+    String(c.email || "").trim() !== "" &&
+    String(c.senha || "").trim() !== "" &&
+    (c.ativacoes?.length || 0) > 0
+  ).length;
+}
+
 /* ============================================================
    Componente
    ============================================================ */
@@ -171,8 +274,15 @@ export function JogosPage() {
   const [lista, setLista] = useState<Jogo[]>(() => getJogosFromStorage());
   const [busca, setBusca] = useState("");
 
+  // Ref com a última lista salva para evitar loop de refresh
+  const listaRef = useRef<Jogo[]>(lista);
+  useEffect(() => { listaRef.current = lista; }, [lista]);
+
   // formulário de novo registro
-  const [form, setForm] = useState<Omit<Jogo, "id" | "cod">>({
+  const [form, setForm] = useState<Omit<Jogo, "id" | "cod" | "codes"> & {
+    /** LEGADO: cria 1ª conta com ativacoes derivadas de 'ativacao' se vier preenchido */
+    codes_text?: string; // descontinuado — mantido só para não quebrar imports antigos
+  }>({
     data: new Date().toISOString().slice(0, 10),
     jogo: "",
     valor: 0,
@@ -183,16 +293,17 @@ export function JogosPage() {
     email: "",
     nick: "",
     senha: "",
-    ativacao: "",
+    ativacao: "", // vai virar ativacoes[] da 1ª conta se informado
     sku_ps4: "",
     sku_ps5: "",
     sku_ps4s: "",
     sku_ps5s: "",
+    codes_text: "", // ignorado
   });
 
   // edição inline
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editRow, setEditRow] = useState<Omit<Jogo, "cod"> | null>(null);
+  const [editRow, setEditRow] = useState<(Omit<Jogo, "cod">) | null>(null);
 
   // modal de contas
   const [modalJogoId, setModalJogoId] = useState<string | null>(null);
@@ -204,22 +315,30 @@ export function JogosPage() {
     email: "",
     nick: "",
     senha: "",
-    ativacao: "",
+    ativacoes: [],
     midia: "PRIMARIA",
   });
+  const [novaContaAtivacoesText, setNovaContaAtivacoesText] = useState<string>("");
 
   // edição de conta (no modal)
   const [editContaId, setEditContaId] = useState<string | null>(null);
   const [editConta, setEditConta] = useState<ContaJogo | null>(null);
+  const [editContaAtivText, setEditContaAtivText] = useState<string>("");
 
   // salva quando muda
-  useEffect(() => setJogosToStorage(lista), [lista]);
-
-  // ouve mudanças feitas por OUTRAS telas (ex.: Pedidos dá baixa no estoque)
   useEffect(() => {
-    const onRefresh = () => setLista(getJogosFromStorage());
+    setJogosToStorage(lista);
+  }, [lista]);
+
+  // ouve mudanças feitas por OUTRAS telas
+  useEffect(() => {
+    const onRefresh = () => {
+      const incoming = getJogosFromStorage();
+      const same = JSON.stringify(incoming) === JSON.stringify(listaRef.current);
+      if (!same) setLista(incoming);
+    };
     window.addEventListener("zion:jogos-updated", onRefresh);
-    window.addEventListener("zion.jogos:refresh", onRefresh); // compat.
+    window.addEventListener("zion.jogos:refresh", onRefresh);
     return () => {
       window.removeEventListener("zion:jogos-updated", onRefresh);
       window.removeEventListener("zion.jogos:refresh", onRefresh);
@@ -236,12 +355,15 @@ export function JogosPage() {
         j.sku_ps4, j.sku_ps5, j.sku_ps4s, j.sku_ps5s,
       ].filter(Boolean).map(String);
 
-      // inclui busca dentro das contas
+      // inclui busca nas contas e nos códigos
       const camposContas = (j.contas || []).flatMap(c => [
-        c.email, c.nick, c.senha, c.ativacao, c.midia
+        c.email, c.nick, c.senha, ...(c.ativacoes || []), c.midia
       ]).filter(Boolean).map(String);
 
-      const todos = [...camposBase, ...camposContas].join("|").toLowerCase();
+      // LEGADO (se ainda existir codes no jogo)
+      const camposCodesJogo = (j.codes || []);
+
+      const todos = [...camposBase, ...camposContas, ...camposCodesJogo].join("|").toLowerCase();
       return todos.includes(q);
     });
   }, [lista, busca]);
@@ -264,6 +386,7 @@ export function JogosPage() {
       sku_ps5: "",
       sku_ps4s: "",
       sku_ps5s: "",
+      codes_text: "",
     });
   }
 
@@ -272,14 +395,13 @@ export function JogosPage() {
     if (!form.jogo.trim()) return;
 
     const contasIniciais: ContaJogo[] = [];
-    // se o usuário preencheu credenciais no cadastro, cria a primeira conta
     if (form.email || form.nick || form.senha || form.ativacao) {
       contasIniciais.push({
         id: uid(),
         email: String(form.email || ""),
         nick: String(form.nick || ""),
         senha: String(form.senha || ""),
-        ativacao: String(form.ativacao || ""),
+        ativacoes: splitCodes(form.ativacao), // MIGRA imediato
         midia: "PRIMARIA",
       });
     }
@@ -332,10 +454,10 @@ export function JogosPage() {
     if (!editingId || !editRow) return;
 
     const normalizada: Jogo = {
-      ...editRow,
+      ...(editRow as any),
       id: editingId,
       cod: 0,
-      valor: Number(editRow.valor) || 0,
+      valor: Number((editRow as any).valor) || 0,
       ps4: Number((editRow as any).ps4) || 0,
       ps5: Number((editRow as any).ps5) || 0,
       ps4s: Number((editRow as any).ps4s) || 0,
@@ -344,7 +466,6 @@ export function JogosPage() {
       sku_ps5: normalizeSku((editRow as any).sku_ps5),
       sku_ps4s: normalizeSku((editRow as any).sku_ps4s),
       sku_ps5s: normalizeSku((editRow as any).sku_ps5s),
-      // mantém contas como estão
       contas: (editRow as any).contas || [],
     };
 
@@ -363,54 +484,65 @@ export function JogosPage() {
       email: "",
       nick: "",
       senha: "",
-      ativacao: "",
+      ativacoes: [],
       midia: "PRIMARIA",
     });
+    setNovaContaAtivacoesText("");
     setEditContaId(null);
     setEditConta(null);
+    setEditContaAtivText("");
   }
   function fecharModal() {
     setModalJogoId(null);
     setEditContaId(null);
     setEditConta(null);
+    setEditContaAtivText("");
   }
 
   function adicionarConta() {
     if (!jogoModal) return;
-    if (!novaConta.email.trim() && !novaConta.nick.trim() && !novaConta.senha.trim() && !novaConta.ativacao.trim()) {
-      alert("Preencha ao menos um campo da conta.");
+    const ativs = splitCodes(novaContaAtivacoesText);
+    if (!novaConta.email.trim() && !novaConta.nick.trim() && !novaConta.senha.trim() && ativs.length === 0) {
+      alert("Preencha ao menos um campo da conta ou inclua códigos.");
       return;
     }
-    const nova: ContaJogo = { ...novaConta, id: uid() };
+    const nova: ContaJogo = { ...novaConta, id: uid(), ativacoes: ativs };
     const atualizada = lista.map(j => j.id === jogoModal.id
       ? { ...j, contas: [ ...(j.contas || []), nova ] }
       : j
     );
     setLista(recomputarCod(atualizada));
     // limpa form
-    setNovaConta({ id: "", email: "", nick: "", senha: "", ativacao: "", midia: "PRIMARIA" });
+    setNovaConta({ id: "", email: "", nick: "", senha: "", ativacoes: [], midia: "PRIMARIA" });
+    setNovaContaAtivacoesText("");
   }
 
   function iniciarEdicaoConta(c: ContaJogo) {
     setEditContaId(c.id);
     setEditConta({ ...c });
+    setEditContaAtivText(joinCodes(c.ativacoes || []));
   }
   function cancelarEdicaoConta() {
     setEditContaId(null);
     setEditConta(null);
+    setEditContaAtivText("");
   }
   function salvarEdicaoConta() {
     if (!jogoModal || !editContaId || !editConta) return;
+    const ativs = splitCodes(editContaAtivText);
     const atualizada = lista.map(j => {
       if (j.id !== jogoModal.id) return j;
       return {
         ...j,
-        contas: (j.contas || []).map(c => c.id === editContaId ? { ...editConta, id: editContaId } : c),
+        contas: (j.contas || []).map(c =>
+          c.id === editContaId ? { ...editConta, id: editContaId, ativacoes: ativs } : c
+        ),
       };
     });
     setLista(recomputarCod(atualizada));
     setEditContaId(null);
     setEditConta(null);
+    setEditContaAtivText("");
   }
   function excluirConta(cId: string) {
     if (!jogoModal) return;
@@ -429,7 +561,9 @@ export function JogosPage() {
         <h1 className="text-xl font-semibold text-slate-900">Jogos</h1>
         <p className="text-slate-600 text-sm">
           Cadastre os jogos. O <b>COD</b> é gerado automaticamente conforme a ordem alfabética do campo <b>Jogo</b>.
-          Os campos <b>PS4/PS5/PS4s/PS5s</b> representam <b>quantidade</b> (0 = não possui).
+          Os campos <b>PS4/PS5/PS4s/PS5s</b> representam <b>quantidade</b> (0 = não possui).<br />
+          Agora, os <b>códigos de ativação</b> ficam <b>dentro de cada conta</b> (aba “Contas → Ativações”), um por linha.
+          Outras telas podem consumir o próximo código por <b>conta</b> ou por <b>SKU + mídia</b>.
         </p>
       </div>
 
@@ -438,7 +572,7 @@ export function JogosPage() {
         <input
           value={busca}
           onChange={(e) => setBusca(e.target.value)}
-          placeholder="Buscar por jogo, SKU ou credenciais das contas..."
+          placeholder="Buscar por jogo, SKU, credenciais ou códigos..."
           className="flex-1 border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-brand-100"
         />
         <div className="text-sm text-slate-500">{filtrada.length} registro(s)</div>
@@ -461,7 +595,7 @@ export function JogosPage() {
             />
           </div>
 
-        <div className="md:col-span-2">
+          <div className="md:col-span-2">
             <label className="text-sm block mb-1">Jogo</label>
             <input
               value={form.jogo}
@@ -552,20 +686,20 @@ export function JogosPage() {
               value={form.senha || ""}
               onChange={(e) => setForm((f) => ({ ...f, senha: e.target.value }))}
               className="w-full border rounded-lg px-3 py-2"
-              type="password"
+              type="text"
             />
           </div>
           <div>
-            <label className="text-sm block mb-1">Ativação — opcional</label>
+            <label className="text-sm block mb-1">Ativações iniciais (1 por linha) — opcional</label>
             <input
               value={form.ativacao || ""}
               onChange={(e) => setForm((f) => ({ ...f, ativacao: e.target.value }))}
               className="w-full border rounded-lg px-3 py-2"
-              placeholder="Código de ativação"
+              placeholder="ABC-123-XYZ\nDEF-456-UVW"
             />
           </div>
           <div className="self-end text-xs text-slate-500">
-            Se preencher, será criada a 1ª conta (mídia PRIMÁRIA).
+            Se preencher, será criada a 1ª conta (mídia PRIMÁRIA) com esses códigos.
           </div>
         </div>
 
@@ -637,6 +771,7 @@ export function JogosPage() {
               <th className="text-center px-3 py-2">PS4s</th>
               <th className="text-center px-3 py-2">PS5s</th>
               <th className="text-left px-3 py-2">SKUs</th>
+              <th className="text-left px-3 py-2">Contas & Códigos</th>
               <th className="text-left px-3 py-2">Informações</th>
               <th className="text-right px-3 py-2">Ações</th>
             </tr>
@@ -644,6 +779,18 @@ export function JogosPage() {
           <tbody>
             {filtrada.map((j) => {
               const emEdicao = editingId === j.id;
+              const contas = j.contas || [];
+
+              // >>>>> NOVO: total de CONTAS VÁLIDAS (email + senha + >=1 código)
+              const totalContasValid = contasValidas(j);
+
+              // Info adicional: somatório de códigos disponíveis (soma de linhas)
+              const totalCodes = contas.reduce((acc, c) => acc + (c.ativacoes?.length || 0), 0);
+
+              // preview: primeiro código encontrado na primeira conta que tiver algum
+              const preview =
+                contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0] ?? undefined;
+
               return (
                 <tr key={j.id} className="border-t">
                   <td className="px-3 py-2">{j.cod}</td>
@@ -652,7 +799,7 @@ export function JogosPage() {
                     {emEdicao ? (
                       <input
                         type="date"
-                        value={editRow?.data || ""}
+                        value={(editRow as any)?.data || ""}
                         onChange={(e) => setEditRow((r) => (r ? { ...r, data: e.target.value } : r))}
                         className="border rounded px-2 py-1"
                       />
@@ -664,7 +811,7 @@ export function JogosPage() {
                   <td className="px-3 py-2">
                     {emEdicao ? (
                       <input
-                        value={editRow?.jogo || ""}
+                        value={(editRow as any)?.jogo || ""}
                         onChange={(e) => setEditRow((r) => (r ? { ...r, jogo: e.target.value } : r))}
                         className="border rounded px-2 py-1 w-56"
                       />
@@ -677,7 +824,7 @@ export function JogosPage() {
                     {emEdicao ? (
                       <input
                         type="number" step="0.01" min="0"
-                        value={editRow?.valor ?? 0}
+                        value={(editRow as any)?.valor ?? 0}
                         onChange={(e) => setEditRow((r) => (r ? { ...r, valor: Number(e.target.value) } : r))}
                         className="border rounded px-2 py-1 w-28 text-right"
                       />
@@ -714,6 +861,15 @@ export function JogosPage() {
                       {j.sku_ps4s && <span>PS4s: {j.sku_ps4s}</span>}
                       {j.sku_ps5s && <span>PS5s: {j.sku_ps5s}</span>}
                       {(!j.sku_ps4 && !j.sku_ps5 && !j.sku_ps4s && !j.sku_ps5s) && <span>—</span>}
+                    </div>
+                  </td>
+
+                  {/* >>>>> RESUMO (Contas & Códigos) */}
+                  <td className="px-3 py-2 align-top">
+                    <div className="text-xs text-slate-700 space-y-0.5">
+                      <div>Contas válidas (e-mail + senha + código): <b>{totalContasValid}</b></div>
+                      <div>Códigos disponíveis (todas as contas): <b>{totalCodes}</b></div>
+                      <div className="text-slate-500 mt-1">Próximo código (preview): <i>{preview || "—"}</i></div>
                     </div>
                   </td>
 
@@ -766,7 +922,7 @@ export function JogosPage() {
             })}
             {filtrada.length === 0 && (
               <tr>
-                <td colSpan={11} className="px-3 py-6 text-center text-slate-500">
+                <td colSpan={12} className="px-3 py-6 text-center text-slate-500">
                   Nenhum registro.
                 </td>
               </tr>
@@ -780,11 +936,9 @@ export function JogosPage() {
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
           onClick={(e) => {
-            // fecha ao clicar fora do conteúdo
             if (e.target === e.currentTarget) fecharModal();
           }}
         >
-          {/* AQUI aumentamos a largura de max-w-3xl -> max-w-6xl */}
           <div className="w-full max-w-6xl bg-white rounded-2xl shadow-xl border border-slate-200 p-4">
             <div className="flex items-start justify-between gap-4 mb-3">
               <div>
@@ -792,7 +946,7 @@ export function JogosPage() {
                   Contas — {jogoModal.jogo}
                 </h3>
                 <p className="text-slate-600 text-sm">
-                  Gerencie as contas deste jogo. Cada conta indica se a mídia é <b>primária</b> ou <b>secundária</b>.
+                  Em cada conta, insira os códigos no campo <b>Ativações</b> (um por linha).
                 </p>
               </div>
               <button onClick={fecharModal} className="text-slate-600 hover:text-slate-800">
@@ -808,7 +962,7 @@ export function JogosPage() {
                     <th className="text-left px-3 py-2">E-mail</th>
                     <th className="text-left px-3 py-2">Nick</th>
                     <th className="text-left px-3 py-2">Senha</th>
-                    <th className="text-left px-3 py-2">Ativação</th>
+                    <th className="text-left px-3 py-2">Ativações</th>
                     <th className="text-left px-3 py-2">Mídia</th>
                     <th className="text-right px-3 py-2">Ações</th>
                   </tr>
@@ -816,8 +970,11 @@ export function JogosPage() {
                 <tbody>
                   {(jogoModal.contas || []).map((c) => {
                     const emEdicao = editContaId === c.id;
+                    const totalC = c.ativacoes?.length || 0;
+                    const preview = c.ativacoes?.[0];
+
                     return (
-                      <tr key={c.id} className="border-t">
+                      <tr key={c.id} className="border-t align-top">
                         <td className="px-3 py-2">
                           {emEdicao ? (
                             <input
@@ -846,15 +1003,27 @@ export function JogosPage() {
                             />
                           ) : c.senha || "—"}
                         </td>
+
+                        {/* Ativações por conta */}
                         <td className="px-3 py-2">
-                          {emEdicao ? (
-                            <input
-                              value={editConta?.ativacao ?? ""}
-                              onChange={(e) => setEditConta((x) => (x ? { ...x, ativacao: e.target.value } : x))}
-                              className="border rounded px-2 py-1 w-48"
-                            />
-                          ) : c.ativacao || "—"}
+                          {!emEdicao ? (
+                            <div className="text-xs text-slate-700 space-y-1">
+                              <div>Total de códigos: <b>{totalC}</b></div>
+                              <div className="text-slate-500">Próximo: <i>{preview || "—"}</i></div>
+                            </div>
+                          ) : (
+                            <div className="w-[420px] max-w-full">
+                              <div className="text-xs mb-1">Ativações (1 por linha)</div>
+                              <textarea
+                                value={editContaAtivText}
+                                onChange={(e) => setEditContaAtivText(e.target.value)}
+                                className="border rounded px-2 py-1 min-h-[140px] w-full"
+                                placeholder={"ABC-123-XYZ\nDEF-456-UVW\nGHI-789-RST"}
+                              />
+                            </div>
+                          )}
                         </td>
+
                         <td className="px-3 py-2">
                           {emEdicao ? (
                             <select
@@ -877,6 +1046,7 @@ export function JogosPage() {
                             </span>
                           )}
                         </td>
+
                         <td className="px-3 py-2 text-right">
                           {!emEdicao ? (
                             <div className="flex gap-3 justify-end">
@@ -941,11 +1111,11 @@ export function JogosPage() {
                   className="border rounded-lg px-3 py-2"
                   type="text"
                 />
-                <input
-                  placeholder="Ativação"
-                  value={novaConta.ativacao}
-                  onChange={(e) => setNovaConta((c) => ({ ...c, ativacao: e.target.value }))}
-                  className="border rounded-lg px-3 py-2"
+                <textarea
+                  placeholder="Ativações (1 por linha)"
+                  value={novaContaAtivacoesText}
+                  onChange={(e) => setNovaContaAtivacoesText(e.target.value)}
+                  className="border rounded-lg px-3 py-2 min-h-[40px]"
                 />
                 <select
                   value={novaConta.midia}

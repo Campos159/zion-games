@@ -1,0 +1,7 @@
+{
+  "include": ["backend"],
+  "exclude": ["node_modules", "dist", "build", "coverage", "src", "public", ".idea", ".vscode"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": true
+}

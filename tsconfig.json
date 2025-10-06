@@ -13,5 +13,9 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": [
+    "src/server/**",        // ⬅️ ignora tudo que é “código de servidor” dentro do front
+    "**/webhooks/**"        // ⬅️ (extra) se você tiver a pasta em outro lugar
+  ]
 }
