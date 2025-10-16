@@ -1,518 +1,411 @@
 // src/pages/VendasPage.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  listarPedidos,
+  listarItens,
+  type PedidoRead,
+  type ItemRead,
+} from "../services/pedidos";
 
-export type Venda = {
-  id: string;
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  PieChart, Pie, Cell, Legend, BarChart, Bar,
+} from "recharts";
 
-  data: string;          // yyyy-mm-dd
-  emailConta: string;    // Email (da conta do jogo)
-  senha: string;         // Senha (da conta do jogo)
-  nick: string;          // Nick
-
-  jogo: string;          // Nome do jogo
-  valor: number;         // Valor (R$)
-  plataforma: "PS4" | "PS5" | "PS4s" | "PS5s"; // único campo
-
-  cliente: string;       // Nome do cliente
-  telefone: string;      // Telefone do cliente
-  ativacao: string;      // Código de ativação
-  emailCliente: string;  // Endereço de email do cliente
-};
-
-const STORAGE_KEY = "zion.vendas";
-
-/** UID simples para localStorage */
-function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
-
-/** Mantém só dígitos */
-function soDigitos(v: string) {
-  return (v || "").replace(/\D+/g, "");
-}
-
-/** Formata telefone dinâmico: (99) 99999-9999 ou (99) 9999-9999 */
-function formatTelefone(v: string) {
-  const d = soDigitos(v).slice(0, 11);
-  if (d.length <= 2) return d;
-  if (d.length <= 6) return `(${d.slice(0, 2)}) ${d.slice(2)}`;
-  if (d.length <= 10) return `(${d.slice(0, 2)}) ${d.slice(2, 6)}-${d.slice(6)}`;
-  return `(${d.slice(0, 2)}) ${d.slice(2, 7)}-${d.slice(7)}`;
-}
+/* ===========================================================
+   CONFIGS / CORES
+   =========================================================== */
+const BLUE = "#1E40AF";
+const COLORS = ["#2563EB", "#3B82F6", "#60A5FA", "#93C5FD"];
 
 const fmtBRL = (n: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n || 0);
 
-function carregar(): Venda[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as Venda[];
-    // ordenar por data desc para exibir recentes primeiro
-    return [...parsed].sort((a, b) => b.data.localeCompare(a.data));
-  } catch {
-    return [];
-  }
+type VendaFlat = {
+  id: string;
+  data: string;       // yyyy-mm-dd (normalizada local)
+  jogo: string;
+  plataforma: string;
+  quantidade: number;
+  total: number;
+  cliente: string;
+  status: string;
+};
+
+/* ===========================================================
+   HELPERS DE DATA (robustos p/ timezone e strings variadas)
+   =========================================================== */
+function ymdLocal(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
-function salvar(lista: Venda[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(lista));
+function parseDateSafe(s: string | undefined | null): Date | null {
+  if (!s) return null;
+  // se vier só yyyy-mm-dd, força como data local meia-noite
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const [Y, M, D] = s.split("-").map(Number);
+    return new Date(Y, (M || 1) - 1, D || 1);
+  }
+  const d = new Date(s);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+function startOfToday() {
+  const n = new Date();
+  return new Date(n.getFullYear(), n.getMonth(), n.getDate());
+}
+function addDays(d: Date, delta: number) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + delta);
+  return x;
+}
+function startOfMonth(d: Date) {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+function sameLocalDay(a: Date, b: Date) {
+  return ymdLocal(a) === ymdLocal(b);
+}
+function isWithinLastDays(d: Date, days: number, today = startOfToday()) {
+  const from = addDays(today, -days + 1); // inclui hoje
+  return d >= from && d <= addDays(today, 0);
 }
 
+/* ===========================================================
+   COMPONENTE
+   =========================================================== */
 export function VendasPage() {
-  const [lista, setLista] = useState<Venda[]>(() => carregar());
-  const [busca, setBusca] = useState("");
+  const [carregando, setCarregando] = useState(true);
+  const [pedidos, setPedidos] = useState<PedidoRead[]>([]);
+  const [itens, setItens] = useState<ItemRead[]>([]);
+  const [filtroPeriodo, setFiltroPeriodo] = useState<"tudo" | "dia" | "semana" | "mes">("tudo");
+  const [somentePagos, setSomentePagos] = useState(false);
 
-  const [form, setForm] = useState<Venda>({
-    id: "",
-    data: new Date().toISOString().slice(0, 10),
-    emailConta: "",
-    senha: "",
-    nick: "",
-    jogo: "",
-    valor: 0,
-    plataforma: "PS4",
-    cliente: "",
-    telefone: "",
-    ativacao: "",
-    emailCliente: "",
-  });
+  // para evitar race entre refreshes
+  const isMountedRef = useRef(true);
 
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editRow, setEditRow] = useState<Venda | null>(null);
+  // ===== fetch centralizado (usado no mount e no intervalo) =====
+  const fetchData = async () => {
+    try {
+      setCarregando(true);
+      const pedidosApi = await listarPedidos();
 
-  useEffect(() => salvar(lista), [lista]);
+      const entries: Array<[number, ItemRead[]]> = await Promise.all(
+        pedidosApi.map(async (p) => {
+          try {
+            const its = await listarItens(p.id);
+            return [p.id, its] as [number, ItemRead[]];
+          } catch {
+            return [p.id, [] as ItemRead[]];
+          }
+        })
+      );
 
-  const filtrada = useMemo(() => {
-    const q = busca.trim().toLowerCase();
-    if (!q) return lista;
-    return lista.filter((v) =>
-      [
-        v.jogo,
-        v.cliente,
-        v.emailCliente,
-        v.emailConta,
-        v.plataforma,
-        v.nick,
-        v.ativacao,
-        v.telefone,
-      ]
-        .join(" | ")
-        .toLowerCase()
-        .includes(q)
-    );
-  }, [lista, busca]);
+      const todosItens = entries.flatMap(([id, arr]) => arr.map((i) => ({ ...i, pedido_id: id } as ItemRead)));
 
-  // ------ criar
-  function adicionar(e: React.FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    if (!form.jogo.trim() || !form.cliente.trim()) return;
-
-    const novo: Venda = {
-      ...form,
-      id: uid(),
-      telefone: formatTelefone(form.telefone),
-    };
-
-    const novaLista = [novo, ...lista]; // adiciona no topo
-    setLista(novaLista);
-    setForm({
-      id: "",
-      data: new Date().toISOString().slice(0, 10),
-      emailConta: "",
-      senha: "",
-      nick: "",
-      jogo: "",
-      valor: 0,
-      plataforma: "PS4",
-      cliente: "",
-      telefone: "",
-      ativacao: "",
-      emailCliente: "",
-    });
-  }
-
-  // ------ remover
-  function remover(id: string) {
-    if (!confirm("Confirma excluir esta venda?")) return;
-    setLista((l) => l.filter((v) => v.id !== id));
-    if (editingId === id) {
-      setEditingId(null);
-      setEditRow(null);
+      if (!isMountedRef.current) return;
+      setPedidos(pedidosApi);
+      setItens(todosItens);
+      // console.debug("Pedidos:", pedidosApi);
+      // console.debug("Itens:", todosItens);
+    } catch (err) {
+      console.error("Erro ao carregar vendas:", err);
+    } finally {
+      if (isMountedRef.current) setCarregando(false);
     }
-  }
+  };
 
-  // ------ editar
-  function iniciarEdicao(v: Venda) {
-    setEditingId(v.id);
-    setEditRow({ ...v });
-  }
-  function cancelarEdicao() {
-    setEditingId(null);
-    setEditRow(null);
-  }
-  function salvarEdicao() {
-    if (!editingId || !editRow) return;
-    const normalizada: Venda = { ...editRow, telefone: formatTelefone(editRow.telefone) };
-    setLista((l) => l.map((v) => (v.id === editingId ? normalizada : v)));
-    setEditingId(null);
-    setEditRow(null);
-  }
+  // ===== mount/unmount + auto refresh 60s =====
+  useEffect(() => {
+    isMountedRef.current = true;
+    fetchData();
+    const id = window.setInterval(fetchData, 60_000); // 60s
+    return () => {
+      isMountedRef.current = false;
+      window.clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // handlers numéricos
-  const setNumForm = (k: keyof Venda) => (e: React.ChangeEvent<HTMLInputElement>) =>
-    setForm((f) => ({ ...f, [k]: Number(e.target.value) || 0 }));
+  // ===== flaten vendas =====
+  const vendas: VendaFlat[] = useMemo(() => {
+    const map = new Map<number, PedidoRead>();
+    pedidos.forEach((p) => map.set(p.id, p));
 
-  const setNumEdit = (k: keyof Venda) => (e: React.ChangeEvent<HTMLInputElement>) =>
-    setEditRow((r) => (r ? { ...r, [k]: Number(e.target.value) || 0 } : r));
+    return itens.map((i) => {
+      const pedido = map.get(i.pedido_id);
+      const total =
+        i.total_item != null
+          ? Number(i.total_item)
+          : Number(i.preco_unitario || 0) * Number(i.quantidade || 0);
 
+      // normaliza data local (yyyy-mm-dd)
+      const d = parseDateSafe(pedido?.data_criacao || "");
+      const dataLocal = d ? ymdLocal(d) : "";
+
+      return {
+        id: `${i.pedido_id}-${i.id}`,
+        data: dataLocal,
+        jogo: i.nome_produto,
+        plataforma: i.plataforma,
+        quantidade: i.quantidade,
+        total,
+        cliente: pedido?.cliente_nome || "",
+        status: pedido?.status || "PENDING",
+      };
+    });
+  }, [pedidos, itens]);
+
+  // ===== filtro por período (agora com definição clara) =====
+  const hoje = startOfToday();
+  const filtradas = useMemo(() => {
+    return vendas.filter((v) => {
+      if (!v.data) return false;
+      const d = parseDateSafe(v.data);
+      if (!d) return false;
+
+      if (somentePagos && v.status !== "PAID") return false;
+
+      switch (filtroPeriodo) {
+        case "dia":
+          return sameLocalDay(d, hoje);
+        case "semana":
+          // últimos 7 dias (rolling, incluindo hoje)
+          return isWithinLastDays(d, 7, hoje);
+        case "mes":
+          // mês calendário atual
+          return d.getFullYear() === hoje.getFullYear() && d.getMonth() === hoje.getMonth();
+        default:
+          return true;
+      }
+    });
+  }, [vendas, filtroPeriodo, somentePagos, hoje]);
+
+  // ===== KPIs =====
+  const totalVendas = filtradas.length;
+  const totalReceita = filtradas.reduce((s, v) => s + v.total, 0);
+
+  // ===== por plataforma =====
+  const porPlataforma = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const v of filtradas) counts[v.plataforma] = (counts[v.plataforma] || 0) + v.quantidade;
+    return Object.entries(counts).map(([name, value]) => ({ name, value }));
+  }, [filtradas]);
+
+  // ===== top jogos =====
+  const topJogos = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const v of filtradas) map.set(v.jogo, (map.get(v.jogo) || 0) + v.quantidade);
+    return Array.from(map.entries())
+      .map(([name, value]) => ({ name, value }))
+      .sort((a, b) => b.value - a.value)
+      .slice(0, 5);
+  }, [filtradas]);
+
+  // ===== top clientes (lista) =====
+  const topClientes = useMemo(() => {
+    const map = new Map<string, { nome: string; qtd: number; total: number }>();
+    for (const v of filtradas) {
+      if (!v.cliente) continue;
+      if (!map.has(v.cliente)) map.set(v.cliente, { nome: v.cliente, qtd: 0, total: 0 });
+      const c = map.get(v.cliente)!;
+      c.qtd += v.quantidade;
+      c.total += v.total;
+    }
+    return Array.from(map.values())
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+  }, [filtradas]);
+
+  // ===== evolução (diária nos períodos; mensal no "tudo") =====
+  const evolucao = useMemo(() => {
+    if (filtroPeriodo === "tudo") {
+      // mensal
+      const map: Record<string, number> = {};
+      for (const v of filtradas) {
+        const d = parseDateSafe(v.data);
+        if (!d) continue;
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+        map[key] = (map[key] || 0) + v.quantidade;
+      }
+      return Object.entries(map)
+        .map(([periodo, vendas]) => ({ periodo, vendas }))
+        .sort((a, b) => a.periodo.localeCompare(b.periodo));
+    } else {
+      // evolução diária no recorte
+      const map: Record<string, number> = {};
+      for (const v of filtradas) {
+        map[v.data] = (map[v.data] || 0) + v.quantidade;
+      }
+
+      // garantir pontos vazios no eixo (especialmente em 'semana' e 'mes')
+      let daysRange: string[] = [];
+      if (filtroPeriodo === "dia") {
+        daysRange = [ymdLocal(hoje)];
+      } else if (filtroPeriodo === "semana") {
+        for (let i = 6; i >= 0; i--) daysRange.push(ymdLocal(addDays(hoje, -i)));
+      } else if (filtroPeriodo === "mes") {
+        const start = startOfMonth(hoje);
+        const temp: string[] = [];
+        for (let d = new Date(start); d <= hoje; d = addDays(d, 1)) {
+          temp.push(ymdLocal(d));
+        }
+        daysRange = temp;
+      }
+
+      const rows = (daysRange.length ? daysRange : Object.keys(map)).map((k) => ({
+        periodo: k,
+        vendas: map[k] || 0,
+      }));
+      return rows.sort((a, b) => a.periodo.localeCompare(b.periodo));
+    }
+  }, [filtradas, filtroPeriodo, hoje]);
+
+  /* ===========================================================
+     RENDER
+     =========================================================== */
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold text-slate-900">Vendas</h1>
-        <p className="text-slate-600 text-sm">
-          Registre as vendas com dados do jogo, conta e cliente. A plataforma é selecionada em um único campo.
-        </p>
-      </div>
-
-      {/* Busca */}
-      <div className="flex flex-col md:flex-row gap-2 md:items-center">
-        <input
-          value={busca}
-          onChange={(e) => setBusca(e.target.value)}
-          placeholder="Buscar por jogo, cliente, e-mail, nick, plataforma..."
-          className="flex-1 border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-brand-100"
-        />
-        <div className="text-sm text-slate-500">{filtrada.length} registro(s)</div>
-      </div>
-
-      {/* Formulário nova venda */}
-      <form onSubmit={adicionar} className="bg-white rounded-2xl shadow-card border border-slate-100 p-4 space-y-4">
-        <div className="grid md:grid-cols-6 gap-3">
-          <div>
-            <label className="text-sm block mb-1">Data</label>
-            <input
-              type="date"
-              value={form.data}
-              onChange={(e) => setForm((f) => ({ ...f, data: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              required
-            />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm block mb-1">Email (conta do jogo)</label>
-            <input
-              type="email"
-              value={form.emailConta}
-              onChange={(e) => setForm((f) => ({ ...f, emailConta: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="conta@exemplo.com"
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Senha</label>
-            <input
-              value={form.senha}
-              onChange={(e) => setForm((f) => ({ ...f, senha: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="••••••••"
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Nick</label>
-            <input
-              value={form.nick}
-              onChange={(e) => setForm((f) => ({ ...f, nick: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="Apelido da conta"
-            />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm block mb-1">Jogo</label>
-            <input
-              value={form.jogo}
-              onChange={(e) => setForm((f) => ({ ...f, jogo: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="Nome do jogo"
-              required
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Valor (R$)</label>
-            <input
-              type="number" step="0.01"
-              value={form.valor}
-              onChange={setNumForm("valor")}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="0,00"
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Plataforma</label>
-            <select
-              value={form.plataforma}
-              onChange={(e) => setForm((f) => ({ ...f, plataforma: e.target.value as any }))}
-              className="w-full border rounded-lg px-3 py-2 bg-white"
-            >
-              <option value="PS4">PS4 (primária)</option>
-              <option value="PS4s">PS4s (secundária)</option>
-              <option value="PS5">PS5 (primária)</option>
-              <option value="PS5s">PS5s (secundária)</option>
-            </select>
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm block mb-1">Cliente</label>
-            <input
-              value={form.cliente}
-              onChange={(e) => setForm((f) => ({ ...f, cliente: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="Nome do cliente"
-              required
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Telefone</label>
-            <input
-              value={form.telefone}
-              onChange={(e) => setForm((f) => ({ ...f, telefone: formatTelefone(e.target.value) }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="(11) 98888-7777"
-              inputMode="numeric"
-            />
-          </div>
-          <div>
-            <label className="text-sm block mb-1">Ativação</label>
-            <input
-              value={form.ativacao}
-              onChange={(e) => setForm((f) => ({ ...f, ativacao: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="Código / instruções"
-            />
-          </div>
-          <div className="md:col-span-2">
-            <label className="text-sm block mb-1">Endereço de Email (cliente)</label>
-            <input
-              type="email"
-              value={form.emailCliente}
-              onChange={(e) => setForm((f) => ({ ...f, emailCliente: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="cliente@exemplo.com"
-            />
-          </div>
-        </div>
-
+    <div className="p-6 space-y-6 max-w-7xl mx-auto">
+      <div className="flex justify-between items-center flex-wrap gap-2">
+        <h1 className="text-2xl font-semibold text-slate-900">
+          Painel de Vendas
+        </h1>
         <div className="flex gap-2">
-          <button className="rounded-lg bg-brand-600 text-white px-4 py-2 hover:bg-brand-700 transition">
-            Adicionar venda
-          </button>
-          <button
-            type="button"
-            onClick={() =>
-              setForm({
-                id: "",
-                data: new Date().toISOString().slice(0, 10),
-                emailConta: "",
-                senha: "",
-                nick: "",
-                jogo: "",
-                valor: 0,
-                plataforma: "PS4",
-                cliente: "",
-                telefone: "",
-                ativacao: "",
-                emailCliente: "",
-              })
-            }
-            className="rounded-lg border px-4 py-2 hover:bg-slate-50"
-          >
-            Limpar
-          </button>
+          {(["tudo", "dia", "semana", "mes"] as const).map((p) => (
+            <button
+              key={p}
+              onClick={() => setFiltroPeriodo(p)}
+              className={`px-3 py-1.5 rounded-lg text-sm ${
+                filtroPeriodo === p
+                  ? "bg-blue-600 text-white"
+                  : "bg-slate-200 hover:bg-slate-300"
+              }`}
+            >
+              {p === "tudo" ? "Tudo" : p === "dia" ? "Hoje" : p === "semana" ? "Semana" : "Mês"}
+            </button>
+          ))}
         </div>
-      </form>
+      </div>
 
-      {/* Tabela */}
-      <div className="bg-white rounded-2xl shadow-card border border-slate-100 overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-slate-700">
-            <tr>
-              <th className="text-left px-3 py-2">Data</th>
-              <th className="text-left px-3 py-2">Jogo</th>
-              <th className="text-left px-3 py-2">Plataforma</th>
-              <th className="text-right px-3 py-2">Valor</th>
-              <th className="text-left px-3 py-2">Email (conta)</th>
-              <th className="text-left px-3 py-2">Nick</th>
-              <th className="text-left px-3 py-2">Cliente</th>
-              <th className="text-left px-3 py-2">Telefone</th>
-              <th className="text-left px-3 py-2">Ativação</th>
-              <th className="text-left px-3 py-2">Email (cliente)</th>
-              <th className="text-right px-3 py-2">Ações</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filtrada.map((v) => {
-              const emEdicao = editingId === v.id;
-              return (
-                <tr key={v.id} className="border-t">
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        type="date"
-                        value={editRow?.data || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, data: e.target.value } : r))}
-                        className="border rounded px-2 py-1"
-                      />
-                    ) : (
-                      v.data
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        value={editRow?.jogo || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, jogo: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-56"
-                      />
-                    ) : (
-                      v.jogo
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <select
-                        value={editRow?.plataforma || "PS4"}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, plataforma: e.target.value as any } : r))}
-                        className="border rounded px-2 py-1 bg-white"
-                      >
-                        <option value="PS4">PS4 (primária)</option>
-                        <option value="PS4s">PS4s (secundária)</option>
-                        <option value="PS5">PS5 (primária)</option>
-                        <option value="PS5s">PS5s (secundária)</option>
-                      </select>
-                    ) : (
-                      v.plataforma
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    {emEdicao ? (
-                      <input
-                        type="number" step="0.01"
-                        value={editRow?.valor ?? 0}
-                        onChange={setNumEdit("valor")}
-                        className="border rounded px-2 py-1 w-24 text-right"
-                      />
-                    ) : (
-                      fmtBRL(v.valor)
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        type="email"
-                        value={editRow?.emailConta || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, emailConta: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-56"
-                      />
-                    ) : (
-                      v.emailConta
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        value={editRow?.nick || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, nick: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-40"
-                      />
-                    ) : (
-                      v.nick
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        value={editRow?.cliente || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, cliente: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-48"
-                      />
-                    ) : (
-                      v.cliente
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        value={editRow?.telefone || ""}
-                        onChange={(e) =>
-                          setEditRow((r) => (r ? { ...r, telefone: formatTelefone(e.target.value) } : r))
-                        }
-                        className="border rounded px-2 py-1 w-40"
-                        inputMode="numeric"
-                      />
-                    ) : (
-                      v.telefone
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        value={editRow?.ativacao || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, ativacao: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-56"
-                      />
-                    ) : (
-                      v.ativacao
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    {emEdicao ? (
-                      <input
-                        type="email"
-                        value={editRow?.emailCliente || ""}
-                        onChange={(e) => setEditRow((r) => (r ? { ...r, emailCliente: e.target.value } : r))}
-                        className="border rounded px-2 py-1 w-56"
-                      />
-                    ) : (
-                      v.emailCliente
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    {!emEdicao ? (
-                      <div className="flex gap-3 justify-end">
-                        <button
-                          onClick={() => iniciarEdicao(v)}
-                          className="text-brand-700 hover:underline"
-                        >
-                          Editar
-                        </button>
-                        <button
-                          onClick={() => remover(v.id)}
-                          className="text-red-600 hover:underline"
-                        >
-                          Excluir
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="flex gap-3 justify-end">
-                        <button onClick={salvarEdicao} className="text-brand-700 hover:underline">
-                          Salvar
-                        </button>
-                        <button onClick={cancelarEdicao} className="text-slate-600 hover:underline">
-                          Cancelar
-                        </button>
-                      </div>
-                    )}
-                  </td>
+      <div className="flex gap-3 items-center">
+        <label className="inline-flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={somentePagos}
+            onChange={(e) => setSomentePagos(e.target.checked)}
+          />
+          Somente pedidos pagos
+        </label>
+        {carregando && <span className="text-sm text-slate-500">Atualizando…</span>}
+      </div>
+
+      {/* KPIs */}
+      <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="bg-blue-600 text-white rounded-2xl p-4">
+          <div className="text-sm opacity-80">Total de Vendas</div>
+          <div className="text-3xl font-bold">{carregando ? "…" : totalVendas}</div>
+        </div>
+        <div className="bg-blue-500 text-white rounded-2xl p-4">
+          <div className="text-sm opacity-80">Receita Total</div>
+          <div className="text-3xl font-bold">{fmtBRL(totalReceita)}</div>
+        </div>
+        <div className="bg-blue-700 text-white rounded-2xl p-4">
+          <div className="text-sm opacity-80">Ticket Médio</div>
+          <div className="text-3xl font-bold">
+            {totalVendas ? fmtBRL(totalReceita / totalVendas) : "R$ 0,00"}
+          </div>
+        </div>
+      </div>
+
+      {/* Gráficos */}
+      <div className="grid lg:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl shadow border border-slate-100 p-4">
+          <h2 className="font-semibold mb-2">
+            {filtroPeriodo === "tudo" ? "Evolução mensal" : "Evolução diária"}
+          </h2>
+          <ResponsiveContainer width="100%" height={250}>
+            <LineChart data={evolucao}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="periodo" />
+              <YAxis allowDecimals={false} />
+              <Tooltip />
+              <Legend />
+              <Line
+                type="monotone"
+                dataKey="vendas"
+                stroke={BLUE}
+                strokeWidth={3}
+                dot={{ r: 4 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow border border-slate-100 p-4">
+          <h2 className="font-semibold mb-2">Top Jogos</h2>
+          <ResponsiveContainer width="100%" height={250}>
+            <BarChart data={topJogos} layout="vertical" margin={{ left: 40 }}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis type="number" allowDecimals={false} />
+              <YAxis dataKey="name" type="category" width={140} />
+              <Tooltip />
+              <Bar dataKey="value" fill={BLUE} barSize={20} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl shadow border border-slate-100 p-4">
+          <h2 className="font-semibold mb-2">Vendas por Plataforma</h2>
+          <ResponsiveContainer width="100%" height={250}>
+            <PieChart>
+              <Pie
+                data={porPlataforma}
+                dataKey="value"
+                nameKey="name"
+                cx="50%"
+                cy="50%"
+                outerRadius={85}
+                label
+              >
+                {porPlataforma.map((_, i) => (
+                  <Cell key={i} fill={COLORS[i % COLORS.length]} />
+                ))}
+              </Pie>
+              <Tooltip />
+              <Legend />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow border border-slate-100 p-4">
+          <h2 className="font-semibold mb-2">Top Clientes</h2>
+          {topClientes.length === 0 ? (
+            <p className="text-slate-500 text-sm text-center py-6">Nenhum cliente encontrado</p>
+          ) : (
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50">
+                <tr>
+                  <th className="text-left px-2 py-1">Cliente</th>
+                  <th className="text-center px-2 py-1">Qtd</th>
+                  <th className="text-right px-2 py-1">Total Gasto</th>
                 </tr>
-              );
-            })}
-            {filtrada.length === 0 && (
-              <tr>
-                <td colSpan={11} className="px-3 py-6 text-center text-slate-500">
-                  Nenhum registro.
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+              </thead>
+              <tbody>
+                {topClientes.map((c) => (
+                  <tr key={c.nome} className="border-t">
+                    <td className="px-2 py-2 font-medium">{c.nome}</td>
+                    <td className="px-2 py-2 text-center">{c.qtd}</td>
+                    <td className="px-2 py-2 text-right text-blue-700 font-semibold">
+                      {fmtBRL(c.total)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
       </div>
     </div>
   );

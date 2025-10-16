@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 // src/pages/EnviosManuaisPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { iniciarEnvio, type FulfillmentPayload } from "../services/fulfillment";
@@ -77,26 +79,22 @@ function onlyDigits(v: string) { return (v || "").replace(/\D+/g, ""); }
 /**
  * Máscara BR local: (DD) XXXX-XXXX ou (DD) 9XXXX-XXXX
  * - Entrada: qualquer coisa; mantém só dígitos (até 11)
- * - Saída: SEM +55 (apenas (ddd) número), como você pediu
+ * - Saída: SEM +55 (apenas (ddd) número)
  */
 function maskPhoneStrict(v: string) {
-  const d = onlyDigits(v).slice(0, 11); // Brasil: até 11 dígitos (com 9)
+  const d = onlyDigits(v).slice(0, 11);
   if (!d) return "";
 
   const dd = d.slice(0, 2);
   const rest = d.slice(2);
 
-  // Montagem progressiva para ficar agradável durante a digitação
   if (d.length <= 2) return `(${dd}`;
-  // 10 dígitos (fixo): (DD) XXXX-XXXX
   if (d.length <= 10) {
     if (rest.length <= 4) return `(${dd}) ${rest}`;
     return `(${dd}) ${rest.slice(0, 4)}-${rest.slice(4)}`;
   }
-  // 11 dígitos (móvel): (DD) 9XXXX-XXXX
-  // primeira parte 5 dígitos (inclui o 9), segunda parte 4 dígitos
   const parteA = rest.slice(0, 5);
-  const parteB = rest.slice(5, 9); // se ainda digitando, pode ter < 4
+  const parteB = rest.slice(5, 9);
   if (rest.length <= 5) return `(${dd}) ${parteA}`;
   return `(${dd}) ${parteA}-${parteB}`;
 }
@@ -110,20 +108,43 @@ function emailValido(v: string) {
   return true;
 }
 
-/* ================== Toasts (avisos canto superior direito) ================== */
+/* ================== Toasts ================== */
 type ToastType = "success" | "error" | "info";
 type Toast = { id: string; type: ToastType; msg: string };
 const TOAST_TTL = 3500;
 
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
-/* ================== Mapeamentos plataforma <-> variante ================== */
+/* ================== Mapeamentos ================== */
 const platToVariante: Record<Plataforma, Variante> = {
   PS4: "PS4 Primária",
   PS4s: "PS4 Secundária",
   PS5: "PS5 Primária",
   PS5s: "PS5 Secundária",
 };
+
+/* ======= n8n Webhook (compatível CRA/Webpack/Vite) ======= */
+const N8N_WEBHOOK_URL: string | undefined =
+  // CRA/Webpack (REACT_APP_)
+  (typeof process !== "undefined" && (process as any)?.env?.REACT_APP_N8N_WEBHOOK_URL) ||
+  // Vite (VITE_)
+  (typeof process !== "undefined" && (process as any)?.env?.VITE_N8N_WEBHOOK_URL) ||
+  // fallback runtime via window
+  (typeof window !== "undefined" && (window as any).__N8N_WEBHOOK_URL__) ||
+  undefined;
+
+async function postToWebhook(url: string, body: any) {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Webhook ${resp.status}: ${text || "falha ao enviar"}`);
+  }
+  return resp.json().catch(() => ({}));
+}
 
 /* ================== Página ================== */
 export default function EnviosManuaisPage() {
@@ -174,9 +195,12 @@ export default function EnviosManuaisPage() {
       const d = JSON.parse(raw) as Draft;
       setOrderId(d.orderId || "");
       setItems(
-        (d.items && d.items.length
-          ? d.items
-          : [{ sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" }]
+        (
+          d.items && d.items.length
+            ? d.items
+            : [
+                { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+              ]
         ).map((it) => ({
           sku: (it.sku || "").toUpperCase(),
           qty: Number(it.qty || 1),
@@ -274,18 +298,22 @@ export default function EnviosManuaisPage() {
     if (autocompletarPorSku && sku) {
       try {
         const midia = midiaFromVariant(v);
-        // Fallback seguro: se a função não existir, tenta buscar jogo e usar codigo_preview
         let codigoPreview = "";
-        if (typeof JogosSvc.previewCodigoPorSkuEMidia === "function") {
-          const prev = await JogosSvc.previewCodigoPorSkuEMidia(sku, midia);
+
+        if (typeof (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia === "function") {
+          const r = await (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia(sku, midia);
+          codigoPreview = r?.codigo || "";
+        } else if (typeof (JogosSvc as any).previewCodigoPorSkuEMidia === "function") {
+          const prev = await (JogosSvc as any).previewCodigoPorSkuEMidia(sku, midia);
           codigoPreview = prev?.codigo || "";
         } else {
-          const j = await JogosSvc.buscarJogoPorSku(sku);
+          const j = await (JogosSvc as any).buscarJogoPorSku(sku);
           codigoPreview = j?.codigo_preview || "";
         }
+
         if (codigoPreview) updateItem(ix, { codigo: codigoPreview });
       } catch {
-        // silencioso; preview é só conveniência
+        // silencioso
       }
     }
   }
@@ -305,7 +333,8 @@ export default function EnviosManuaisPage() {
     setSkuStatus((s) => ({ ...s, [ix]: "loading" }));
     setSkuErrorMsg((s) => ({ ...s, [ix]: "" }));
     try {
-      const jogo = await JogosSvc.buscarJogoPorSku(sku);
+      // 1) Busca metadados do jogo pelo SKU
+      const jogo = await (JogosSvc as any).buscarJogoPorSku(sku);
       if (!jogo) {
         setSkuStatus((s) => ({ ...s, [ix]: "notfound" }));
         setSkuDetected((s) => ({ ...s, [ix]: null }));
@@ -313,12 +342,13 @@ export default function EnviosManuaisPage() {
         return;
       }
 
+      // 2) Descobre variante conforme console + mídia
       const sug: Variante =
         jogo.console === "PS4"
-          ? (jogo.tipo_midia.toLowerCase().startsWith("sec") ? "PS4 Secundária" : "PS4 Primária")
-          : (jogo.tipo_midia.toLowerCase().startsWith("sec") ? "PS5 Secundária" : "PS5 Primária");
+          ? (jogo.tipo_midia.toLowerCase().includes("sec") ? "PS4 Secundária" : "PS4 Primária")
+          : (jogo.tipo_midia.toLowerCase().includes("sec") ? "PS5 Secundária" : "PS5 Primária");
 
-      // aplica variação sugerida e credenciais
+      // 3) Aplica dados básicos no item
       updateItem(ix, {
         variant: sug,
         variant_name: defaultVariantName(sug),
@@ -327,25 +357,21 @@ export default function EnviosManuaisPage() {
         senhaRaw: jogo.senha ? senha2(jogo.senha) : items[ix].senhaRaw,
       });
 
-      // PREVIEW por SKU + MÍDIA com fallback
-      try {
-        const midia = midiaFromVariant(sug);
-        let codigoPreview = "";
-        if (typeof JogosSvc.previewCodigoPorSkuEMidia === "function") {
-          const prev = await JogosSvc.previewCodigoPorSkuEMidia(sku, midia);
-          codigoPreview = prev?.codigo || "";
-        } else {
-          codigoPreview = jogo.codigo_preview || "";
-        }
-        updateItem(ix, {
-          // só sobrescreve se vazio (se usuário digitou, não troca)
-          codigo: items[ix].codigo?.trim() ? items[ix].codigo : codigoPreview,
-        });
-      } catch {
-        if (!items[ix].codigo?.trim() && jogo.codigo_preview) {
-          updateItem(ix, { codigo: jogo.codigo_preview });
-        }
+      // 4) Busca o CÓDIGO correto no estoque via SKU + MÍDIA (sem consumir)
+      const midia = midiaFromVariant(sug);
+      let codigoReal = "";
+
+      if (typeof (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia === "function") {
+        const r = await (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia(sku, midia);
+        codigoReal = r?.codigo || "";
+      } else if (typeof (JogosSvc as any).previewCodigoPorSkuEMidia === "function") {
+        const prev = await (JogosSvc as any).previewCodigoPorSkuEMidia(sku, midia);
+        codigoReal = prev?.codigo || "";
+      } else {
+        codigoReal = jogo.codigo_preview || "";
       }
+
+      updateItem(ix, { codigo: codigoReal });
 
       setSkuDetected((s) => ({ ...s, [ix]: jogo }));
       setSkuStatus((s) => ({ ...s, [ix]: "success" }));
@@ -371,7 +397,7 @@ export default function EnviosManuaisPage() {
   function onPasteSku(ix: number, e: React.ClipboardEvent<HTMLInputElement>) {
     const pasted = e.clipboardData.getData("text");
     if (!pasted) return;
-    e.preventDefault(); // evita duplicar
+    e.preventDefault();
     const cleaned = pasted.toUpperCase();
     updateItem(ix, { sku: cleaned });
     const existing = debounceTimers.current[ix];
@@ -384,6 +410,112 @@ export default function EnviosManuaisPage() {
     const t = debounceTimers.current[ix];
     if (t) window.clearTimeout(t);
     fetchSku(ix, true);
+  }
+
+  /* ================== LISTA DE PEDIDOS ================== */
+  const [carregaPedidos, setCarregaPedidos] = useState(true);
+  const [pedidos, setPedidos] = useState<PedidoRead[]>([]);
+  const [busca, setBusca] = useState("");
+  const [somentePagos, setSomentePagos] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        setCarregaPedidos(true);
+        const data = await listarPedidos();
+        setPedidos(data);
+      } finally {
+        setCarregaPedidos(false);
+      }
+    })();
+  }, []);
+
+  const isPago = (status?: string | null) => /pago|paid/i.test(String(status || ""));
+
+  const pedidosOrdenados = useMemo(() => {
+    const q = busca.trim().toLowerCase();
+    let base = pedidos.filter((p) => !p.enviado);
+    if (somentePagos) base = base.filter((p) => isPago(p.status));
+    if (q) {
+      base = base.filter((p) =>
+        [p.codigo, p.cliente_nome, p.cliente_email, p.telefone, p.status]
+          .map((x) => (x || "").toString().toLowerCase())
+          .join("|")
+          .includes(q)
+      );
+    }
+    const ts = (d?: string | null) => (d ? new Date(d).getTime() : 0);
+    return base
+      .slice()
+      .sort((a, b) => {
+        const diff = ts(a.data_criacao) - ts(b.data_criacao);
+        if (diff !== 0) return diff;
+        return (a.id ?? 0) - (b.id ?? 0);
+      });
+  }, [pedidos, busca, somentePagos]);
+
+  const pedidoAtual = useMemo(() => {
+    if (!orderId) return null;
+    return (
+      pedidos.find((p) => String(p.codigo || p.id) === String(orderId).trim()) || null
+    );
+  }, [orderId, pedidos]);
+
+  // util: limpa controles/timers de SKU quando trocamos todo o conjunto de itens
+  function resetSkuControls() {
+    Object.values(debounceTimers.current).forEach((t) => { if (t) window.clearTimeout(t as any); });
+    debounceTimers.current = {};
+    lastSearchedSku.current = {};
+    setSkuStatus({});
+    setSkuDetected({});
+    setSkuErrorMsg({});
+  }
+
+  async function carregarPedidoNaTela(p: PedidoRead) {
+    try {
+      setLoading(true);
+      setOk(null);
+      setErro(null);
+
+      const rows: ItemRead[] = await listarItens(p.id);
+
+      const mapped: ItemForm[] = rows.map((r) => {
+        const variante = platToVariante[r.plataforma as Plataforma] || "PS5 Primária";
+        return {
+          sku: (r.sku || "").toUpperCase(),
+          qty: Number(r.quantidade || 1),
+          name: r.nome_produto || "",
+          variant: variante,
+          variant_name: defaultVariantName(variante),
+          login: r.email_conta || "",
+          senhaRaw: r.senha_conta || "",
+          codigo: r.codigo_ativacao || "",
+        };
+      });
+
+      resetSkuControls();
+
+      setOrderId(String(p.codigo || p.id));
+      setItems(mapped.length ? mapped : [
+        { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+      ]);
+      setNomeCliente(p.cliente_nome || "");
+      setEmail(p.cliente_email || "");
+      setPhoneMask(maskPhoneStrict(p.telefone || ""));
+
+      setTimeout(() => {
+        mapped.forEach((_, ix) => fetchSku(ix, true));
+      }, 0);
+
+      showToast("info", `Pedido #${p.id} carregado no formulário.`);
+      if (!isPago(p.status)) {
+        showToast("error", "ATENÇÃO: esse pedido não está pago. O envio será bloqueado até o pagamento.");
+      }
+    } catch (e: any) {
+      showToast("error", `Falha ao carregar itens do pedido: ${e?.message || "erro"}`);
+    } finally {
+      setLoading(false);
+    }
   }
 
   /* ---------- Validação ---------- */
@@ -401,8 +533,28 @@ export default function EnviosManuaisPage() {
     const d = onlyDigits(phoneMask);
     if (d.length < 8) return "Telefone muito curto. Informe ao menos 8 dígitos.";
     if (!viaWhatsapp && !viaEmail) return "Selecione pelo menos um canal (WhatsApp ou E-mail).";
+
+    // exigir pedido pago
+    if (pedidoAtual && !/pago|paid/i.test(String(pedidoAtual.status || ""))) {
+      return "O pedido selecionado ainda não está pago.";
+    }
     return null;
   }
+
+  /* --- Disparo automático de busca por SKU ao montar e quando SKUs mudarem --- */
+  const skusSignature = useMemo(() => items.map(it => it.sku?.trim().toUpperCase() || "").join("|"), [items]);
+
+  useEffect(() => {
+    items.forEach((it, ix) => {
+      const sku = (it.sku || "").trim();
+      if (sku) {
+        const t = debounceTimers.current[ix];
+        if (t) window.clearTimeout(t);
+        fetchSku(ix, true);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skusSignature]);
 
   /* ---------- Enviar ---------- */
   async function onEnviar() {
@@ -426,18 +578,15 @@ export default function EnviosManuaisPage() {
             credentials: {
               login: it.login.trim(),
               senha: senha2(it.senhaRaw),
-              // enviamos o que está no campo (preview/manual);
-              // o consumo real virá APÓS o envio OK.
-              codigo: it.codigo.trim(),
-              variant: it.variant, // mantemos para auditoria
+              codigo: it.codigo.trim(), // preview (antes do consumo)
+              variant: it.variant,
             },
           })),
           customer: {
             name: nomeCliente.trim(),
             email: email.trim(),
-            // >>> Mantemos E.164 correto para o backend: prefixo +55 automático
             phone_e164: `+55${onlyDigits(phoneMask)}`,
-            // compat legado (n8n)
+            // compat legado
             login: items[0]?.login?.trim() || "",
             senha: senha2(items[0]?.senhaRaw || ""),
             codigo: items[0]?.codigo?.trim() || "",
@@ -476,31 +625,102 @@ export default function EnviosManuaisPage() {
 
       showToast("success", "Envio disparado com sucesso. Consumindo códigos…");
 
-      // Após envio OK: consumir 1 código por item (SKU + MÍDIA) com fallback
+      // Após envio OK: consumir 1 código por item (SKU + MÍDIA) com fallback e preparar payload do webhook.
+      const itensFinal: Array<{
+        sku: string;
+        qty: number;
+        name: string;
+        variant_name: string;
+        midia: Midia;
+        credentials: { login: string; senha: string; codigo: string; variant: Variante };
+      }> = [];
+
       for (let i = 0; i < items.length; i++) {
         try {
           const skuBase = items[i].sku.trim().toUpperCase();
           const midia = midiaFromVariant(items[i].variant);
 
-          // normalizamos null -> undefined para satisfazer o TS
-          let consumo: { codigo?: string } | undefined;
-
-          if (typeof JogosSvc.consumirCodigoPorSkuEMidia === "function") {
-            const r = await JogosSvc.consumirCodigoPorSkuEMidia(skuBase, midia);
-            consumo = r ?? undefined;
-          } else if (typeof JogosSvc.consumirCodigoPorSku === "function") {
-            const r = await JogosSvc.consumirCodigoPorSku(skuBase);
-            consumo = r ?? undefined;
+          let codigoConsumido: string | undefined;
+          if (typeof (JogosSvc as any).consumirCodigoPorSkuEMidia === "function") {
+            const r = await (JogosSvc as any).consumirCodigoPorSkuEMidia(skuBase, midia);
+            codigoConsumido = r?.codigo;
+          } else if (typeof (JogosSvc as any).consumirCodigoPorSku === "function") {
+            const r = await (JogosSvc as any).consumirCodigoPorSku(skuBase);
+            codigoConsumido = r?.codigo;
           } else {
             throw new Error("Serviço de consumo de código não disponível.");
           }
 
-          if (!consumo?.codigo) throw new Error("Sem código disponível para este SKU.");
-          updateItem(i, { codigo: consumo.codigo }); // atualiza com o código efetivamente consumido (e removido)
-          showToast("success", `Código consumido (${skuBase}/${midia}): ${consumo.codigo}`);
+          if (!codigoConsumido) throw new Error("Sem código disponível para este SKU.");
+
+          updateItem(i, { codigo: codigoConsumido });
+          itensFinal.push({
+            sku: skuBase,
+            qty: items[i].qty,
+            name: items[i].name.trim(),
+            variant_name: items[i].variant_name.trim(),
+            midia,
+            credentials: {
+              login: items[i].login.trim(),
+              senha: senha2(items[i].senhaRaw),
+              codigo: codigoConsumido,
+              variant: items[i].variant,
+            },
+          });
+
+          showToast("success", `Código consumido (${skuBase}/${midia}): ${codigoConsumido}`);
         } catch (e: any) {
           showToast("error", `Falha ao consumir código do item #${i + 1}: ${e?.message || "erro"}`);
         }
+      }
+
+      // Disparo do webhook para n8n — somente se houver URL configurada
+      if (N8N_WEBHOOK_URL) {
+        try {
+          const body = {
+            event: "fulfillment_ok",
+            source: "zion-admin",
+            timestamp: new Date().toISOString(),
+            order: {
+              id: payload.order.order_id,
+              status: pedidoAtual?.status || "desconhecido",
+              paid: pedidoAtual ? isPago(pedidoAtual.status) : true,
+              sale_channel: payload.order.sale_channel,
+            },
+            customer: {
+              name: nomeCliente.trim(),
+              email: email.trim(),
+              phone_local: phoneMask,
+              phone_e164: `+55${onlyDigits(phoneMask)}`,
+            },
+            options: {
+              send_via: payload.options?.send_via || [],
+              deadline_minutes: payload.options?.deadline_minutes,
+            },
+            items: itensFinal.length
+              ? itensFinal
+              : items.map((it) => ({
+                  sku: it.sku.trim().toUpperCase(),
+                  qty: it.qty,
+                  name: it.name.trim(),
+                  variant_name: it.variant_name.trim(),
+                  midia: midiaFromVariant(it.variant),
+                  credentials: {
+                    login: it.login.trim(),
+                    senha: senha2(it.senhaRaw),
+                    codigo: it.codigo.trim(),
+                    variant: it.variant,
+                  },
+                })),
+          };
+
+          await postToWebhook(N8N_WEBHOOK_URL, body);
+          showToast("success", "Dados enviados ao n8n ✅");
+        } catch (e: any) {
+          showToast("error", `Webhook n8n falhou: ${e?.message || "erro"}`);
+        }
+      } else {
+        console.warn("N8N webhook não configurado — defina REACT_APP_N8N_WEBHOOK_URL, VITE_N8N_WEBHOOK_URL ou window.__N8N_WEBHOOK_URL__.");
       }
     } catch (e: any) {
       console.error("Disparar Envio:", e);
@@ -508,116 +728,6 @@ export default function EnviosManuaisPage() {
       setErro(msg);
       setOk(false);
       showToast("error", msg);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function preencherExemplo() {
-    setOrderId("MANUAL-" + Math.floor(Math.random() * 99999));
-    setItems([
-      { sku: "EAFC25-PS5-PRI", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
-      { sku: "GOW-PS4-SEC", qty: 1, name: "", variant: "PS4 Secundária", variant_name: "PlayStation 4", login: "", senhaRaw: "", codigo: "" },
-    ]);
-    setNomeCliente("Fulano de Tal");
-    setEmail("fulano@exemplo.com");
-    // >>> Agora o exemplo já vem no novo formato local (sem +55)
-    setPhoneMask("(11) 98888-7777");
-    setViaWhatsapp(true);
-    setViaEmail(true);
-    setOk(null);
-    setErro(null);
-    setSkuStatus({});
-    setSkuDetected({});
-    setSkuErrorMsg({});
-    showToast("info", "Exemplo preenchido. Cole um SKU válido para autocompletar.");
-  }
-
-  /* --- Ao montar / quando items mudam, tenta buscar SKUs pré-preenchidos --- */
-  useEffect(() => {
-    items.forEach((it, ix) => {
-      const sku = (it.sku || "").trim();
-      if (sku) {
-        const t = debounceTimers.current[ix];
-        if (t) window.clearTimeout(t);
-        fetchSku(ix, true);
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [/* apenas quando quantidade de itens muda */ items.length]);
-
-  /* ================== LISTA DE PEDIDOS (para preencher a tela) ================== */
-  const [carregaPedidos, setCarregaPedidos] = useState(true);
-  const [pedidos, setPedidos] = useState<PedidoRead[]>([]);
-  const [busca, setBusca] = useState("");
-
-  useEffect(() => {
-    (async () => {
-      try {
-        setCarregaPedidos(true);
-        const data = await listarPedidos();
-        setPedidos(data);
-      } finally {
-        setCarregaPedidos(false);
-      }
-    })();
-  }, []);
-
-  const pedidosOrdenados = useMemo(() => {
-    const q = busca.trim().toLowerCase();
-    let base = pedidos.filter((p) => !p.enviado); // foco: em separação
-    if (q) {
-      base = base.filter((p) =>
-        [p.codigo, p.cliente_nome, p.cliente_email, p.telefone, p.status]
-          .map((x) => (x || "").toString().toLowerCase())
-          .join("|")
-          .includes(q)
-      );
-    }
-    const ts = (d?: string | null) => (d ? new Date(d).getTime() : 0);
-    return base
-      .slice()
-      .sort((a, b) => {
-        const diff = ts(a.data_criacao) - ts(b.data_criacao); // MAIS ANTIGOS PRIMEIRO
-        if (diff !== 0) return diff;
-        return (a.id ?? 0) - (b.id ?? 0);
-      });
-  }, [pedidos, busca]);
-
-  async function carregarPedidoNaTela(p: PedidoRead) {
-    try {
-      setLoading(true);
-      setOk(null);
-      setErro(null);
-
-      // Carrega itens do pedido
-      const rows: ItemRead[] = await listarItens(p.id);
-
-      // Converte itens do backend para os campos da tela
-      const mapped: ItemForm[] = rows.map((r) => {
-        const variante = platToVariante[r.plataforma as Plataforma] || "PS5 Primária";
-        return {
-          sku: (r.sku || "").toUpperCase(),
-          qty: Number(r.quantidade || 1),
-          name: r.nome_produto || "",
-          variant: variante,
-          variant_name: defaultVariantName(variante),
-          login: r.email_conta || "",           // se você usa email_conta como login
-          senhaRaw: r.senha_conta || "",        // mantemos raw; enviaremos a 2ª
-          codigo: r.codigo_ativacao || "",      // se já existir
-        };
-      });
-
-      setOrderId(String(p.codigo || p.id));
-      setItems(mapped.length ? mapped : [
-        { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
-      ]);
-      setNomeCliente(p.cliente_nome || "");
-      setEmail(p.cliente_email || "");
-      setPhoneMask(maskPhoneStrict(p.telefone || ""));
-      showToast("info", `Pedido #${p.id} carregado no formulário.`);
-    } catch (e: any) {
-      showToast("error", `Falha ao carregar itens do pedido: ${e?.message || "erro"}`);
     } finally {
       setLoading(false);
     }
@@ -654,9 +764,34 @@ export default function EnviosManuaisPage() {
             />
             Autocompletar por SKU
           </label>
+          <label className="inline-flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={somentePagos}
+              onChange={(e) => setSomentePagos(e.target.checked)}
+            />
+            Mostrar só pagos
+          </label>
           <button
             className="px-3 py-2 rounded-2xl bg-slate-600 hover:bg-slate-700 text-white"
-            onClick={preencherExemplo}
+            onClick={() => {
+              setOrderId("MANUAL-" + Math.floor(Math.random() * 99999));
+              setItems([
+                { sku: "EAFC25-PS5-PRI", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+                { sku: "GOW-PS4-SEC", qty: 1, name: "", variant: "PS4 Secundária", variant_name: "PlayStation 4", login: "", senhaRaw: "", codigo: "" },
+              ]);
+              setNomeCliente("Fulano de Tal");
+              setEmail("fulano@exemplo.com");
+              setPhoneMask("(11) 98888-7777");
+              setViaWhatsapp(true);
+              setViaEmail(true);
+              setOk(null);
+              setErro(null);
+              setSkuStatus({});
+              setSkuDetected({});
+              setSkuErrorMsg({});
+              showToast("info", "Exemplo preenchido. Cole um SKU válido para autocompletar.");
+            }}
             type="button"
           >
             Preencher Exemplo
@@ -672,7 +807,7 @@ export default function EnviosManuaisPage() {
         </div>
       </div>
 
-      {/* LAYOUT: coluna de pedidos (esquerda) + formulário (direita) */}
+      {/* LAYOUT: coluna de pedidos + formulário */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* ===== COLUNA DE PEDIDOS ===== */}
         <div className="lg:col-span-1">
@@ -701,7 +836,14 @@ export default function EnviosManuaisPage() {
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="font-semibold text-sm">{p.cliente_nome}</div>
-                    <span className="text-[10px] uppercase tracking-wide bg-amber-100 text-amber-800 border border-amber-200 rounded-full px-2 py-0.5">
+                    <span
+                      className={clsx(
+                        "text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border",
+                        isPago(p.status)
+                          ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                          : "bg-amber-100 text-amber-800 border-amber-200"
+                      )}
+                    >
                       {p.status}
                     </span>
                   </div>
@@ -934,7 +1076,7 @@ export default function EnviosManuaisPage() {
         </div>
       </div>
 
-      {/* estilo mínimo para inputs (com “corzinha”) */}
+      {/* estilo mínimo para inputs */}
       <style>{`
         .input {
           background: rgba(99, 102, 241, 0.10);

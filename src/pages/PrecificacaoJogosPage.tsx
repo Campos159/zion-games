@@ -7,8 +7,8 @@ export type Precificacao = {
   cod: number;              // gerado por ordem alfabética do Jogo
   jogo: string;             // "Jogo PS4/PS5"
   plataforma: "PS4" | "PS5" | "Ambos";
-  valor: number;            // preço de venda
-  revenda: number;          // preço para revenda (R$)
+  valor: number;            // preço de venda (final) = 0.75 * baseDigitado
+  revenda: number;          // preço para revenda (final) = 0.75 * valor
   ps4Est: number;           // estoque PS4
   ps5Est: number;           // estoque PS5
   estoqueTotal: number;     // calculado = ps4Est + ps5Est
@@ -52,6 +52,11 @@ function salvar(lista: Precificacao[]) {
 const fmtBRL = (n: number) =>
   new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n || 0);
 
+// >>> helpers de cálculo (com arredondamento em 2 casas)
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const calcValorFinal = (base: number) => round2((base || 0) * 0.75);
+const calcRevendaFinal = (valorFinal: number) => round2((valorFinal || 0) * 0.75);
+
 export function PrecificacaoJogosPage() {
   const [lista, setLista] = useState<Precificacao[]>(() => carregar());
   const [busca, setBusca] = useState("");
@@ -62,8 +67,8 @@ export function PrecificacaoJogosPage() {
   >>({
     jogo: "",
     plataforma: "PS4",
-    valor: 0,
-    revenda: 0,
+    valor: 0,   // <- aqui o usuário DIGITA o "base"
+    revenda: 0, // será sobrescrito no salvar
     ps4Est: 0,
     ps5Est: 0,
     promoInicio: "",
@@ -92,7 +97,7 @@ export function PrecificacaoJogosPage() {
   // ---- calcular campos derivados
   function derivar(r: Omit<Precificacao, "estoqueTotal" | "totalValor">): Precificacao {
     const estoqueTotal = (r.ps4Est || 0) + (r.ps5Est || 0);
-    const totalValor = (r.valor || 0) * estoqueTotal; // total baseado no preço de venda
+    const totalValor = (r.valor || 0) * estoqueTotal; // total baseado no preço de venda (já final)
     return { ...r, estoqueTotal, totalValor };
   }
 
@@ -101,10 +106,16 @@ export function PrecificacaoJogosPage() {
     e.preventDefault();
     if (!form.jogo.trim()) return;
 
+    // >>> transforma o que foi DIGITADO em "valor final" e "revenda final"
+    const valorFinal = calcValorFinal(form.valor);           // 0.75 do digitado
+    const revendaFinal = calcRevendaFinal(valorFinal);       // 0.75 do valorFinal
+
     const novo: Precificacao = derivar({
       id: uid(),
       cod: 0,
       ...form,
+      valor: valorFinal,      // >>> salva o final
+      revenda: revendaFinal,  // >>> salva o final
     });
 
     const atualizada = recomputarCod([...lista, novo]);
@@ -112,8 +123,8 @@ export function PrecificacaoJogosPage() {
     setForm({
       jogo: "",
       plataforma: "PS4",
-      valor: 0,
-      revenda: 0,
+      valor: 0,     // volta a ser o "campo base" para digitar
+      revenda: 0,   // será recalculado no próximo salvar
       ps4Est: 0,
       ps5Est: 0,
       promoInicio: "",
@@ -139,7 +150,17 @@ export function PrecificacaoJogosPage() {
   function iniciarEdicao(r: Precificacao) {
     setEditingId(r.id);
     const { cod, estoqueTotal, totalValor, ...resto } = r;
-    setEditRow(resto);
+
+    // >>> Na edição, o input "Valor" também será tratado como BASE digitável.
+    // Para o usuário ver algo coerente ao entrar em edição, mostramos uma sugestão de base
+    // aproximada (valorFinal / 0.75), arredondada para 2 casas.
+    const baseSugerida = r.valor ? round2(r.valor / 0.75) : 0;
+
+    setEditRow({
+      ...resto,
+      valor: baseSugerida, // >>> o campo de edição de "valor" vira base
+      // revenda fica como está (será recalculada ao salvar)
+    });
   }
   function cancelarEdicao() {
     setEditingId(null);
@@ -147,7 +168,19 @@ export function PrecificacaoJogosPage() {
   }
   function salvarEdicao() {
     if (!editingId || !editRow) return;
-    const normalizada = derivar({ ...editRow, id: editingId, cod: 0 });
+
+    // >>> aplica a mesma regra na edição:
+    const valorFinal = calcValorFinal(editRow.valor);     // 0.75 do que o usuário digitou em edição
+    const revendaFinal = calcRevendaFinal(valorFinal);    // 0.75 do valorFinal
+
+    const normalizada = derivar({
+      ...editRow,
+      id: editingId,
+      cod: 0,
+      valor: valorFinal,        // >>> salva final
+      revenda: revendaFinal,    // >>> salva final
+    });
+
     const nova = lista.map((r) => (r.id === editingId ? normalizada : r));
     const atualizada = recomputarCod(nova);
     setLista(atualizada);
@@ -208,6 +241,7 @@ export function PrecificacaoJogosPage() {
             </select>
           </div>
           <div>
+            {/* Importante: este campo continua sendo o que o usuário DIGITA (base) */}
             <label className="text-sm block mb-1">Valor (R$)</label>
             <input
               type="number"
@@ -217,16 +251,21 @@ export function PrecificacaoJogosPage() {
               className="w-full border rounded-lg px-3 py-2"
               placeholder="0,00"
             />
+            {/* Opcional: dica visual do que será salvo */}
+            <div className="text-[11px] text-slate-500 mt-1">
+              Será salvo: {fmtBRL(calcValorFinal(form.valor))} | Revenda: {fmtBRL(calcRevendaFinal(calcValorFinal(form.valor)))}
+            </div>
           </div>
           <div>
             <label className="text-sm block mb-1">Revenda (R$)</label>
             <input
               type="number"
               step="0.01"
-              value={form.revenda}
-              onChange={setNumForm("revenda")}
-              className="w-full border rounded-lg px-3 py-2"
+              value={calcRevendaFinal(calcValorFinal(form.valor))}  // >>> exibe o valor que será salvo
+              readOnly                                        // >>> revenda é sempre derivada
+              className="w-full border rounded-lg px-3 py-2 bg-slate-50"
               placeholder="0,00"
+              title="Revenda é calculada automaticamente (0,75 × Valor salvo)"
             />
           </div>
           <div>
@@ -364,6 +403,7 @@ export function PrecificacaoJogosPage() {
                         type="number" step="0.01" value={editRow?.valor ?? 0}
                         onChange={setNumEdit("valor")}
                         className="border rounded px-2 py-1 w-28 text-right"
+                        title="Digite o valor base; o valor salvo será 0,75 × base"
                       />
                     ) : (
                       fmtBRL(r.valor)
@@ -372,9 +412,10 @@ export function PrecificacaoJogosPage() {
                   <td className="px-3 py-2 text-right">
                     {emEdicao ? (
                       <input
-                        type="number" step="0.01" value={editRow?.revenda ?? 0}
-                        onChange={setNumEdit("revenda")}
-                        className="border rounded px-2 py-1 w-28 text-right"
+                        type="number" step="0.01" value={calcRevendaFinal(calcValorFinal(editRow?.valor ?? 0))}
+                        readOnly
+                        className="border rounded px-2 py-1 w-28 text-right bg-slate-50"
+                        title="Revenda é 0,75 × Valor (final)"
                       />
                     ) : (
                       fmtBRL(r.revenda)

@@ -1,23 +1,17 @@
 // src/services/jogos.ts
-/**
- * Service para integração com o storage de Jogos/Contas/Códigos.
- * Compatível com a estrutura do JogosPage (contas possuem `ativacoes: string[]`).
- */
+// Service de Jogos baseado no localStorage usado pelas telas.
+// Ele não importa componentes React. Tudo é feito por leitura/gravação do storage.
 
+// ====== Tipos compatíveis ======
 export type Midia = "PRIMARIA" | "SECUNDARIA";
-export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
-
-export const JOGOS_STORAGE_KEY = "zion.jogos";
-
-/* ========================= Tipos públicos (usados nas telas) ========================= */
 
 export type ContaJogo = {
   id: string;
   email: string;
   nick: string;
   senha: string;
-  ativacoes: string[];
-  midia: Midia;
+  ativacoes: string[];   // códigos por conta (um por linha)
+  midia: Midia;          // PRIMARIA | SECUNDARIA
 };
 
 export type Jogo = {
@@ -30,68 +24,56 @@ export type Jogo = {
   ps5: number;
   ps4s: number;
   ps5s: number;
-  contas?: ContaJogo[];
-
   sku_ps4?: string;
   sku_ps5?: string;
   sku_ps4s?: string;
   sku_ps5s?: string;
-
-  // LEGADO (não usamos mais, mas pode existir no storage antigo)
-  codes?: string[];
-  email?: string;
-  nick?: string;
-  senha?: string;
-  ativacao?: string;
+  contas?: ContaJogo[];
+  // legados ignorados aqui
 };
 
-/**
- * Retorno de buscarJogoPorSku — pensado para a tela de envios:
- * - identifica console e tipo de mídia deduzidos pelo SKU
- * - devolve preview de código (se houver)
- * - devolve credenciais (login/senha), quando a conta existir
- */
-export type JogoPorSku = {
-  id_jogo: string;
-  nome_jogo: string;
-  console: "PS4" | "PS5";
-  tipo_midia: "Primaria" | "Secundaria"; // humano-legível
-  sku: string;
+export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
 
+// Resposta simplificada usada pelo EnviosManuaisPage no autocompletar
+export type JogoPorSku = {
+  console: "PS4" | "PS5";
+  tipo_midia: "PRIMARIA" | "SECUNDARIA";
+  nome_jogo: string;
   login?: string;
-  senha?: string; // raw (a tela pega a 2ª com a função senha2)
+  senha?: string;
   codigo_preview?: string;
 };
 
-/* ========================= Utils internas ========================= */
+const STORAGE_KEY = "zion.jogos";
 
-function normalizeSku(s?: string | null): string {
-  return (s ?? "").toString().trim().replace(/\s+/g, "").toUpperCase();
+// ====== helpers ======
+function normalizeSku(s: string | undefined | null): string {
+  return (s ?? "").toString().trim().replace(/\s+/g, "");
 }
 
-function getJogos(): Jogo[] {
+function loadAll(): Jogo[] {
   try {
-    const raw = localStorage.getItem(JOGOS_STORAGE_KEY);
+    const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw) as Jogo[];
-    return Array.isArray(parsed) ? parsed : [];
+    const arr = JSON.parse(raw) as Jogo[];
+    // normalização mínima
+    return Array.isArray(arr) ? arr : [];
   } catch {
     return [];
   }
 }
 
-function setJogos(lista: Jogo[]) {
-  localStorage.setItem(JOGOS_STORAGE_KEY, JSON.stringify(lista));
+function saveAll(lista: Jogo[]) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(lista));
   try { window.dispatchEvent(new CustomEvent("zion:jogos-updated")); } catch {}
   try { window.dispatchEvent(new Event("zion.jogos:refresh")); } catch {}
 }
 
-/** Localiza o jogo e em qual "coluna" o SKU bateu */
+/** Localiza jogo + de qual coluna veio o match (ps4/ps5/ps4s/ps5s) */
 function findBySku(skuRaw: string): { jogo: Jogo; plataforma: PlataformaKey } | null {
   const sku = normalizeSku(skuRaw);
   if (!sku) return null;
-  const lista = getJogos();
-
+  const lista = loadAll();
   for (const j of lista) {
     if (normalizeSku(j.sku_ps4) === sku)  return { jogo: j, plataforma: "ps4"  };
     if (normalizeSku(j.sku_ps5) === sku)  return { jogo: j, plataforma: "ps5"  };
@@ -102,118 +84,151 @@ function findBySku(skuRaw: string): { jogo: Jogo; plataforma: PlataformaKey } | 
 }
 
 function plataformaToConsole(pl: PlataformaKey): "PS4" | "PS5" {
-  return pl.startsWith("ps4") ? "PS4" : "PS5";
+  return (pl === "ps4" || pl === "ps4s") ? "PS4" : "PS5";
 }
 function plataformaToMidia(pl: PlataformaKey): Midia {
   return (pl === "ps4s" || pl === "ps5s") ? "SECUNDARIA" : "PRIMARIA";
 }
-function midiaLabel(m: Midia): "Primaria" | "Secundaria" {
-  return m === "PRIMARIA" ? "Primaria" : "Secundaria";
-}
 
-/** Escolhe a CONTA preferencial do jogo com base na mídia (ou a primeira disponível) */
-function pickConta(jogo: Jogo, midiaPreferida?: Midia): ContaJogo | undefined {
-  const contas = jogo.contas || [];
-  if (!contas.length) return undefined;
-  if (midiaPreferida) {
-    const m = contas.find(c => c.midia === midiaPreferida);
-    if (m) return m;
-  }
+/** Retorna a primeira conta da mídia pedida que tenha pelo menos 1 código (ou qualquer conta dessa mídia se não tiver). */
+function pickContaByMidia(j: Jogo, midia: Midia): ContaJogo | undefined {
+  const contas = j.contas || [];
+  // Preferir conta com códigos
+  let c = contas.find(c => c.midia === midia && (c.ativacoes?.length || 0) > 0);
+  if (c) return c;
+  // Senão, qualquer conta dessa mídia (sem códigos)
+  c = contas.find(c => c.midia === midia);
+  if (c) return c;
+  // Como fallback (raro): primeira conta
   return contas[0];
 }
 
-/** Remove e retorna o primeiro código da conta (imutável) */
-function popPrimeiroCodigo(conta: ContaJogo): { novo: ContaJogo; codigo?: string } {
-  const pool = conta.ativacoes || [];
-  if (!pool.length) return { novo: conta, codigo: undefined };
-  const [codigo, ...resto] = pool;
-  return { novo: { ...conta, ativacoes: resto }, codigo };
-}
+// ====== API exposta ======
 
-/* ========================= API pública (usada pelas telas) ========================= */
-
-/**
- * Busca um jogo por SKU e retorna informações para autocompletar a tela.
- * Faz o *preview* do próximo código da conta correspondente à mídia do SKU.
- */
+/** Busca o jogo por SKU e retorna dados para autocompletar a UI. */
 export async function buscarJogoPorSku(skuRaw: string): Promise<JogoPorSku | null> {
   const hit = findBySku(skuRaw);
   if (!hit) return null;
 
   const { jogo, plataforma } = hit;
-  const midia = plataformaToMidia(plataforma);
   const consoleName = plataformaToConsole(plataforma);
+  const midiaSugerida = plataformaToMidia(plataforma);
 
-  const conta = pickConta(jogo, midia);
-  const preview = conta?.ativacoes?.[0];
+  // escolher conta da mídia sugerida
+  const conta = pickContaByMidia(jogo, midiaSugerida);
+  const preview = conta?.ativacoes?.[0] || undefined;
 
   return {
-    id_jogo: jogo.id,
-    nome_jogo: jogo.jogo,
     console: consoleName,
-    tipo_midia: midiaLabel(midia),
-    sku: normalizeSku(skuRaw),
-    login: conta?.email || "",          // você usa email como login
+    tipo_midia: midiaSugerida,
+    nome_jogo: jogo.jogo,
+    login: conta?.email || "",
     senha: conta?.senha || "",
-    codigo_preview: preview || "",
+    codigo_preview: preview,
   };
 }
 
-/**
- * Preview por SKU + MÍDIA (sem consumir).
- * Útil quando o usuário troca a variação manualmente na tela.
- */
+/** Preview do próximo código (sem consumir) por SKU + Mídia. */
 export async function previewCodigoPorSkuEMidia(
   skuRaw: string,
   midia: Midia
 ): Promise<{ codigo?: string } | null> {
   const hit = findBySku(skuRaw);
   if (!hit) return null;
-  const conta = pickConta(hit.jogo, midia);
-  return { codigo: conta?.ativacoes?.[0] };
+
+  const conta = pickContaByMidia(hit.jogo, midia);
+  const preview = conta?.ativacoes?.[0] || undefined;
+  return { codigo: preview };
 }
 
-/**
- * Consome (remove) **1** código por SKU + MÍDIA e persiste no storage.
- * Retorna o código efetivamente consumido.
- */
+/** Consome (remove) o próximo código disponível por SKU + Mídia e salva no storage. */
 export async function consumirCodigoPorSkuEMidia(
   skuRaw: string,
   midia: Midia
 ): Promise<{ codigo?: string } | null> {
-  const lista = getJogos();
-  const hit = findBySku(skuRaw);
-  if (!hit) return null;
+  const sku = normalizeSku(skuRaw);
+  if (!sku) return { codigo: undefined };
 
-  const jogoIdx = lista.findIndex((j) => j.id === hit.jogo.id);
-  if (jogoIdx < 0) return null;
+  const lista = loadAll();
 
-  const jogo = lista[jogoIdx];
+  // localizar jogo e índice
+  const idxJogo = lista.findIndex(j =>
+    normalizeSku(j.sku_ps4) === sku ||
+    normalizeSku(j.sku_ps5) === sku ||
+    normalizeSku(j.sku_ps4s) === sku ||
+    normalizeSku(j.sku_ps5s) === sku
+  );
+  if (idxJogo < 0) return { codigo: undefined };
+
+  const jogo = lista[idxJogo];
   const contas = jogo.contas || [];
-  if (!contas.length) return { codigo: undefined };
 
-  // seleciona a conta correta
-  const idxConta = contas.findIndex((c) => c.midia === midia);
-  const pos = idxConta >= 0 ? idxConta : 0;
+  // procurar conta com essa mídia que tenha códigos
+  let idxConta = contas.findIndex(c => c.midia === midia && (c.ativacoes?.length || 0) > 0);
 
-  const { novo, codigo } = popPrimeiroCodigo(contas[pos]);
-  const novasContas = contas.map((c, i) => (i === pos ? novo : c));
+  // se não tiver, usar uma conta da mesma mídia (sem códigos) — consumirá "nada"
+  if (idxConta < 0) idxConta = contas.findIndex(c => c.midia === midia);
 
-  lista[jogoIdx] = { ...jogo, contas: novasContas };
-  setJogos(lista);
+  if (idxConta < 0) {
+    // nenhum slot/conta com essa mídia → nada a consumir
+    return { codigo: undefined };
+  }
+
+  const conta = contas[idxConta];
+  const pool = Array.isArray(conta.ativacoes) ? conta.ativacoes.slice() : [];
+
+  if (pool.length === 0) {
+    // não há códigos nessa conta
+    return { codigo: undefined };
+  }
+
+  // Consome o primeiro código
+  const codigo = pool.shift()!;
+
+  // Persistir de volta
+  const contaAtualizada: ContaJogo = { ...conta, ativacoes: pool };
+  const contasAtualizadas = contas.map((c, k) => (k === idxConta ? contaAtualizada : c));
+  const jogoAtualizado: Jogo = { ...jogo, contas: contasAtualizadas };
+  const listaAtualizada = [
+    ...lista.slice(0, idxJogo),
+    jogoAtualizado,
+    ...lista.slice(idxJogo + 1),
+  ];
+
+  saveAll(listaAtualizada);
 
   return { codigo };
 }
 
-/**
- * Compatibilidade: consome **1** código deduzindo a mídia a partir do SKU.
- * (Usado como fallback por telas antigas.)
- */
+/** Fallback antigo: consome por SKU (independente de mídia). Mantido para compatibilidade. */
 export async function consumirCodigoPorSku(
   skuRaw: string
 ): Promise<{ codigo?: string } | null> {
   const hit = findBySku(skuRaw);
   if (!hit) return null;
-  const midia = plataformaToMidia(hit.plataforma);
-  return consumirCodigoPorSkuEMidia(skuRaw, midia);
+
+  // preferência: PRIMARIA; se não tiver, SECUNDARIA; senão qualquer
+  const ordem: Midia[] = ["PRIMARIA", "SECUNDARIA"];
+  for (const m of ordem) {
+    const r = await consumirCodigoPorSkuEMidia(skuRaw, m);
+    if (r?.codigo) return r;
+  }
+  // nada encontrado
+  return { codigo: undefined };
+}
+
+export async function buscarCodigoDisponivelPorSkuEMidia(
+  skuRaw: string,
+  midia: Midia
+): Promise<{ codigo?: string } | null> {
+  const hit = findBySku(skuRaw);
+  if (!hit) return null;
+
+  const conta = pickContaByMidia(hit.jogo, midia);
+  if (!conta) return null;
+
+  // pega o primeiro código disponível da conta correta
+  const codigo = conta.ativacoes?.length ? conta.ativacoes[0] : undefined;
+
+  return { codigo };
 }

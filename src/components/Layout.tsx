@@ -102,6 +102,16 @@ export function Layout() {
                 Envios Manuais
               </Link>
             </li>
+
+            <li>
+              <Link
+                to="/promocoes"
+                className={`block rounded px-3 py-2 text-sm ${isActiveExact("/promocoes")}`}
+              >
+                Promoções (PS Store)
+              </Link>
+            </li>
+
           </ul>
         </nav>
 

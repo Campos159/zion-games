@@ -6,11 +6,11 @@ import json
 import hmac
 import uuid
 import hashlib
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional, Any, Dict, Tuple
 
-# Sem dependências externas: usar urllib
 import urllib.request
 from urllib.error import URLError, HTTPError
 
@@ -21,7 +21,17 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from . import schemas, crud, emailer
-import re  # <--- (usado na sanitização do email)
+
+# ======================================================
+# Importa o router de promoções com fallback
+# ======================================================
+try:
+    from .promocoes import router as promocoes_router
+    HAS_PROMO_ROUTER = True
+except Exception as e:
+    print(f"[WARN] Falha ao importar promocoes.py: {e}")
+    promocoes_router = None
+    HAS_PROMO_ROUTER = False
 
 # ---------------------------------------------------------------------
 # DB boot
@@ -31,14 +41,13 @@ Base.metadata.create_all(bind=engine)
 # ---------------------------------------------------------------------
 # App + CORS
 # ---------------------------------------------------------------------
-app = FastAPI(title="Zion Admin API", version="0.5.0")
+app = FastAPI(title="Zion Admin API", version="0.5.1")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://zion-admin-beta.vercel.app",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -47,12 +56,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def _startup_notice():
+    print("✅ Zion Admin API iniciada.")
+    print("   - Banco conectado.")
+    print(f"   - Rota /promocoes ativada: {HAS_PROMO_ROUTER}")
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 # ---------------------------------------------------------------------
-# Helpers (saneamento para evitar 422)
+# Registra router de promoções ou rota mock
+# ---------------------------------------------------------------------
+if HAS_PROMO_ROUTER:
+    app.include_router(promocoes_router)
+else:
+    @app.get("/promocoes/listar")
+    def _promocoes_mock():
+        """Mock simples para testar o front caso promocoes.py falhe"""
+        return {
+            "fonte": "mock",
+            "promocoes": [
+                {
+                    "nome": "GTA V PS4",
+                    "preco_original": 199.90,
+                    "preco_atual": 79.90,
+                    "desconto": 60.0,
+                    "fim_promocao": "2025-10-31",
+                    "preco_zion": 59.90,
+                    "url": "https://store.playstation.com/pt-br/product/UP1004-CUSA00419_00-GTAVDIGITALDOWNL",
+                },
+                {
+                    "nome": "EA SPORTS FC 25 PS5",
+                    "preco_original": 399.90,
+                    "preco_atual": 249.90,
+                    "desconto": 38.0,
+                    "fim_promocao": "2025-10-28",
+                    "preco_zion": 189.90,
+                    "url": "https://store.playstation.com/pt-br/product/UP0006-PPSA07408_00-EASPORTSFC25PS5",
+                },
+            ],
+        }
+
+# ---------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------
 def _safe_platform(value: str | None) -> schemas.Plataforma:
     allowed = {"PS4", "PS4s", "PS5", "PS5s"}
@@ -76,8 +124,7 @@ def _safe_date_str(v) -> str:
     if isinstance(v, str):
         return v
     if hasattr(v, "isoformat"):
-        s = v.isoformat()
-        return s.split("T")[0]
+        return v.isoformat().split("T")[0]
     return str(v)
 
 def _safe_datetime_str(v) -> str | None:
@@ -90,25 +137,12 @@ def _safe_datetime_str(v) -> str | None:
     return str(v)
 
 def _normalize_email_for_response(value) -> str:
-    """
-    Normaliza e-mail para evitar 422 por formatos ruins e garante TLD público válido.
-
-    Mudanças importantes:
-    - Fallback agora usa domínio público 'zion.games' (válido para EmailStr).
-    - Rejeita domínios 'special-use' (.local, localhost, example, invalid, test).
-    - Se não houver TLD, acrescenta '.com'.
-    - Limpa local-part para caracteres aceitos.
-    """
     FALLBACK = "no-reply@zion.games"
-
     if value is None:
         return FALLBACK
-
     s = str(value).strip()
     if s.lower().startswith("mailto:"):
         s = s[7:].strip()
-
-    # Correções básicas frequentes
     s = (
         s.replace("(at)", "@")
          .replace("[at]", "@")
@@ -119,43 +153,30 @@ def _normalize_email_for_response(value) -> str:
          .replace("<", "")
          .replace(">", "")
     )
-
     if "@" not in s:
         return FALLBACK
-
     local, _, domain = s.rpartition("@")
     local = local or "no-reply"
     domain = (domain or "").lower()
-
-    # Se veio 'Nome <email@dominio>' e algo escapou, já removemos <> acima.
-    # Trata domínios reservados / inválidos
     reserved_roots = {"localhost", "local", "example", "invalid", "test"}
     if domain.endswith(".local") or domain in reserved_roots:
         domain = "zion.games"
-
-    # Se o domínio não possui ponto (sem TLD), acrescente '.com'
     if "." not in domain:
         domain = f"{domain}.com"
-
-    # Sanitiza local-part (mantém alfanum, . _ + -)
     local = re.sub(r"[^A-Za-z0-9._+-]", "", local) or "no-reply"
-
     return f"{local}@{domain}"
 
 # =====================================================================
 # Configs de Integração (n8n + Yampi)
 # =====================================================================
-# n8n (fulfillment)
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")  # ex.: https://seu-n8n.com/webhook/dispatch
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 N8N_HMAC_SECRET = (os.getenv("N8N_HMAC_SECRET") or "").encode("utf-8")
 N8N_DRY_RUN = (os.getenv("N8N_DRY_RUN") or "").lower() in ("1", "true", "yes")
 
-# Yampi API
 YAMPI_API_BASE = os.getenv("YAMPI_API_BASE", "https://api.yampi.com.br/v1")
-YAMPI_API_TOKEN = os.getenv("YAMPI_API_TOKEN", "")  # Bearer token
-YAMPI_WEBHOOK_SECRET = (os.getenv("YAMPI_WEBHOOK_SECRET") or "").encode("utf-8")  # HMAC do webhook
+YAMPI_API_TOKEN = os.getenv("YAMPI_API_TOKEN", "")
+YAMPI_WEBHOOK_SECRET = (os.getenv("YAMPI_WEBHOOK_SECRET") or "").encode("utf-8")
 
-# Idempotência simples em memória (trocar por Redis/DB em prod)
 _IDEM_CACHE: set[str] = set()
 
 # =====================================================================
@@ -195,15 +216,10 @@ def _http_json(method: str, url: str, body: dict | None = None,
         raise HTTPException(status_code=502, detail=f"Falha HTTP para {url}: {e.reason}")
 
 # =====================================================================
-# Fulfillment: Site ⇄ n8n (HMAC + Idempotency)
+# Fulfillment: Site ⇄ n8n
 # =====================================================================
-
 @app.post("/fulfillment/create")
 async def fulfillment_create(req: Request):
-    """
-    Recebe payload do site, garante idempotência, assina com HMAC e repassa ao Webhook do n8n.
-    Em N8N_DRY_RUN ou sem config do n8n, responde 200 com dry_run.
-    """
     try:
         body = await req.json()
         if not isinstance(body, dict):
@@ -220,7 +236,6 @@ async def fulfillment_create(req: Request):
         _IDEM_CACHE.add(idem_key)
         return {"ok": True, "status": 200, "data": {"dry_run": True, "idempotency_key": idem_key}}
 
-    # Assina e chama o n8n
     raw = json.dumps(body, separators=(",", ":")).encode("utf-8")
     signature = _hmac_sign(raw, N8N_HMAC_SECRET)
     code, j = _http_json(
@@ -235,9 +250,6 @@ async def fulfillment_create(req: Request):
 
 @app.post("/fulfillment/status")
 async def fulfillment_status(req: Request, db: Session = Depends(get_db)):
-    """
-    Callback do n8n (HMAC). Se status == "delivered", marca entregue na Yampi.
-    """
     raw = await req.body()
     if not N8N_HMAC_SECRET:
         raise HTTPException(status_code=500, detail="N8N_HMAC_SECRET ausente")
@@ -250,8 +262,6 @@ async def fulfillment_status(req: Request, db: Session = Depends(get_db)):
     payload = json.loads(raw or b"{}")
     order_id = str(payload.get("order_id", "")).strip()
     status = str(payload.get("status", "")).strip().lower()
-
-    # TODO: persistir timeline de fulfillment se desejar
 
     if order_id and status == "delivered":
         _yampi_mark_delivered(order_id)
@@ -268,9 +278,6 @@ def _yampi_auth_headers() -> dict:
     return {"Authorization": f"Bearer {YAMPI_API_TOKEN}"}
 
 def _yampi_mark_delivered(order_id: str):
-    """
-    Marca pedido como 'delivered' na Yampi.
-    """
     url = f"{YAMPI_API_BASE}/orders/{order_id}"
     body = {"status": "delivered"}
     code, j = _http_json("PUT", url, body=body, headers=_yampi_auth_headers())
@@ -278,10 +285,6 @@ def _yampi_mark_delivered(order_id: str):
         print(f"[YAMPI] Falha ao marcar entregue {order_id}: {code} {j}")
 
 def _yampi_update_stock_by_sku(sku: str, quantity: int):
-    """
-    Atualiza estoque na Yampi por SKU.
-    OBS: confirme o endpoint exato da sua conta Yampi (products/variants/inventory).
-    """
     url = f"{YAMPI_API_BASE}/products/{sku}/stock"  # ajuste se necessário
     body = {"quantity": int(quantity)}
     code, j = _http_json("PUT", url, body=body, headers=_yampi_auth_headers())
@@ -289,38 +292,28 @@ def _yampi_update_stock_by_sku(sku: str, quantity: int):
         print(f"[YAMPI] Falha ao atualizar estoque SKU={sku}: {code} {j}")
 
 def _yampi_verify_webhook(req: Request, raw: bytes) -> None:
-    """
-    Verifica HMAC do webhook da Yampi (ajuste o header se o seu for diferente).
-    """
     if not YAMPI_WEBHOOK_SECRET:
-        return  # sem HMAC configurado → não valida (recomendado: usar HMAC)
+        return
     provided = req.headers.get("x-yampi-signature", "") or req.headers.get("X-Yampi-Signature", "")
     expected = _hmac_sign(raw, YAMPI_WEBHOOK_SECRET)
     if not provided or provided != expected:
         raise HTTPException(status_code=401, detail="Assinatura Yampi inválida")
 
 def _criar_pedido_local_de_yampi(db: Session, yampi_order: dict) -> tuple[schemas.PedidoRead, list[schemas.ItemRead]]:
-    """
-    Converte um pedido vindo da Yampi para seu modelo e grava no DB.
-    Ajuste os campos conforme o payload real da Yampi.
-    """
-    # --- cliente: normaliza e-mail para evitar ValidationError
     customer = (yampi_order.get("customer") or {})
     safe_email = _normalize_email_for_response(customer.get("email") or "")
 
-    # 1) Pedido
     pedido_in = schemas.PedidoCreate(
         codigo=str(yampi_order.get("code") or yampi_order.get("id") or ""),
         status="PAID" if str(yampi_order.get("status", "")).lower() in ("paid", "approved") else "PENDING",
         cliente_nome=(customer.get("name") or "") or "",
-        cliente_email=safe_email,  # <<< garantia de e-mail válido
+        cliente_email=safe_email,
         telefone=customer.get("phone", "") or "",
         data_criacao=_safe_date_str(datetime.utcnow()),
     )
     pedido = crud.criar_pedido(db, pedido_in)
     ped_out = schemas.PedidoRead.model_validate(pedido)
 
-    # 2) Itens
     itens_out: list[schemas.ItemRead] = []
     for it in (yampi_order.get("items") or []):
         plataformas = {
@@ -345,9 +338,6 @@ def _criar_pedido_local_de_yampi(db: Session, yampi_order: dict) -> tuple[schema
     return ped_out, itens_out
 
 def _disparar_fulfillment_n8n(pedido: schemas.PedidoRead, itens: list[schemas.ItemRead]):
-    """
-    Monta payload para seu fluxo do n8n e dispara via /fulfillment/create local.
-    """
     first = itens[0] if itens else None
     variant_map = {"PS4": "PS4 Secundária", "PS4s": "PS4 Secundária", "PS5": "PS5 Primária", "PS5s": "PS5 Secundária"}
     variant = variant_map.get(first.plataforma if first else "PS5", "PS5 Primária")
@@ -383,13 +373,6 @@ def _disparar_fulfillment_n8n(pedido: schemas.PedidoRead, itens: list[schemas.It
 
 @app.post("/yampi/webhook")
 async def yampi_webhook(req: Request, db: Session = Depends(get_db)):
-    """
-    Webhook da Yampi:
-      - order.created / order.paid → cria pedido local + dispara fulfillment (se pago)
-      - order.delivered → (opcional) marcar local
-      - product.updated / inventory.updated → sincroniza estoque local
-    Validação HMAC via YAMPI_WEBHOOK_SECRET (recomendada).
-    """
     raw = await req.body()
     _yampi_verify_webhook(req, raw)
 
@@ -403,11 +386,9 @@ async def yampi_webhook(req: Request, db: Session = Depends(get_db)):
     product = payload.get("product") or {}
     inventory = payload.get("inventory") or {}
 
-    # ---- Pedidos
     if event in ("order.created", "order.paid"):
         codigo = str((order.get("code") or order.get("id") or "")).strip()
 
-        # existing = crud.obter_pedido_por_codigo(db, codigo)  # se você tiver essa função
         existing = None
 
         if existing:
@@ -423,16 +404,13 @@ async def yampi_webhook(req: Request, db: Session = Depends(get_db)):
         return {"ok": True}
 
     if event == "order.delivered":
-        # crud.marcar_entregue_por_codigo(db, order.get("code"))
         return {"ok": True}
 
-    # ---- Estoque vindo da Yampi → Site
     if event in ("product.updated", "inventory.updated"):
         sku = str(product.get("sku") or inventory.get("sku") or "").strip()
         qty = int(inventory.get("quantity") or product.get("quantity") or 0)
         if sku:
             try:
-                # crud.atualizar_estoque_por_sku(db, sku, qty)
                 pass
             except Exception as e:
                 print(f"[YAMPI→SITE] Falha ao atualizar estoque {sku}: {e}")
@@ -677,9 +655,6 @@ def criar_venda(data: schemas.VendaCreate, db: Session = Depends(get_db)):
 # Emails: enviar por ITEM e marcar como enviado
 # ---------------------------------------------------------------------
 class SendItemPayload(BaseModel):
-    """
-    Payload flexível para evitar 422 e aceitar FormData/JSON com chaves variadas.
-    """
     model_config = ConfigDict(extra="allow")
     item_id: int | str
     destinatario: str
@@ -711,9 +686,6 @@ def _coerce_send_item_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/emails/send-item")
 async def emails_send_item(request: Request, db: Session = Depends(get_db)):
-    """
-    Aceita JSON e FormData, monta e envia o e-mail e marca apenas o item como enviado.
-    """
     ct = (request.headers.get("content-type") or "").lower()
     if ct.startswith("application/json"):
         raw = await request.json()

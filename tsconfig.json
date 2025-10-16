@@ -11,11 +11,13 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["vite/client"]
+
+    // 🔧 Adiciona os tipos do Node.js e do Vite
+    "types": ["vite/client", "node"]
   },
   "include": ["src"],
   "exclude": [
-    "src/server/**",        // ⬅️ ignora tudo que é “código de servidor” dentro do front
-    "**/webhooks/**"        // ⬅️ (extra) se você tiver a pasta em outro lugar
+    "src/server/**",
+    "**/webhooks/**"
   ]
 }
