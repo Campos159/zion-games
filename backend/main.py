@@ -21,6 +21,10 @@ from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from . import schemas, crud, emailer
+from fastapi import FastAPI
+from api import yampi_webhook
+
+
 
 # ======================================================
 # Importa o router de promoções com fallback
@@ -42,6 +46,7 @@ Base.metadata.create_all(bind=engine)
 # App + CORS
 # ---------------------------------------------------------------------
 app = FastAPI(title="Zion Admin API", version="0.5.1")
+app.include_router(yampi_webhook.router)
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
