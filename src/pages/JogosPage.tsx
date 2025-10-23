@@ -1,11 +1,11 @@
 // src/pages/JogosPage.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
 
 /* ============================================================
    Tipos e constantes
    ============================================================ */
 export type Midia = "PRIMARIA" | "SECUNDARIA";
-// >>> NOVO: plataforma/versão por conta
 export type PlataformaConta = "PS4" | "PS5" | "PS4s" | "PS5s";
 
 export type ContaJogo = {
@@ -13,49 +13,32 @@ export type ContaJogo = {
   email: string;
   nick: string;
   senha: string;
-
-  /** NOVO: lista de códigos de ativação, 1 por item */
   ativacoes: string[];
-
-  /** LEGADO: ainda lido na migração; não mais usado na UI */
-  ativacao?: string;
-
-  midia: Midia; // PRIMARIA | SECUNDARIA
-
-  // >>> NOVO: versão da conta (slot/plataforma)
+  ativacao?: string; // legado
+  midia: Midia;
   plataforma: PlataformaConta;
 };
 
 export type Jogo = {
-  id: string;            // id interno (não é o COD)
-  cod: number;           // gerado automaticamente (sequência ordenada por nome)
-  data: string;          // ISO (yyyy-mm-dd)
-  jogo: string;          // nome do jogo
-  valor: number;         // preço
-
-  // Quantidades por plataforma/slot (0 = não tem)
-  ps4: number;           // quantidade PS4 primária
-  ps5: number;           // quantidade PS5 primária
-  ps4s: number;          // quantidade PS4 secundária
-  ps5s: number;          // quantidade PS5 secundária
-
-  // coleção de contas por jogo
+  id: string;
+  cod: number;
+  data: string;
+  jogo: string;
+  valor: number;
+  ps4: number;
+  ps5: number;
+  ps4s: number;
+  ps5s: number;
   contas?: ContaJogo[];
-
-  // SKUs por slot (para localizar o jogo via SKU)
   sku_ps4?: string;
   sku_ps5?: string;
   sku_ps4s?: string;
   sku_ps5s?: string;
-
-  /** LEGADO: pool único de códigos por jogo — apenas para migração se existir */
-  codes?: string[];
-
-  // LEGADO (criação rápida de primeira conta)
-  email?: string;
-  nick?: string;
-  senha?: string;
-  ativacao?: string;
+  codes?: string[]; // legado
+  email?: string;   // legado formulário rápido
+  nick?: string;    // legado
+  senha?: string;   // legado
+  ativacao?: string;// legado
 };
 
 export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
@@ -63,15 +46,12 @@ export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
 export const JOGOS_STORAGE_KEY = "zion.jogos";
 
 /* ============================================================
-   Helpers compartilhados (exportados para outras telas)
+   Helpers compartilhados
    ============================================================ */
-
-/** Normaliza SKU: trim + sem espaços internos */
 export function normalizeSku(s: string | undefined | null): string {
   return (s ?? "").toString().trim().replace(/\s+/g, "");
 }
 
-/** NOVO: checa duplicidade de SKU em outros jogos (impede salvar) */
 function skuDuplicadoNoContexto(
   lista: Jogo[],
   editingId: string | null,
@@ -81,12 +61,11 @@ function skuDuplicadoNoContexto(
   const sku = normalizeSku(value);
   if (!sku) return false;
   return lista.some(j => {
-    if (j.id === editingId) return false; // ignora o próprio jogo em edição
+    if (j.id === editingId) return false;
     return normalizeSku((j as any)[k]) === sku;
   });
 }
 
-/** Reatribui COD ordenando por nome do jogo */
 function recomputarCod(lista: Jogo[]): Jogo[] {
   const ordenada = [...lista].sort((a, b) =>
     a.jogo.localeCompare(b.jogo, "pt-BR", { sensitivity: "base" })
@@ -94,12 +73,10 @@ function recomputarCod(lista: Jogo[]): Jogo[] {
   return ordenada.map((j, idx) => ({ ...j, cod: idx + 1 }));
 }
 
-/** Gera um id simples */
 function uid() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
-/** Converte texto em lista de códigos. Preferência: 1 por linha, mas aceita vírgula/;/. */
 function splitCodes(text?: string | string[]): string[] {
   if (!text) return [];
   if (Array.isArray(text)) {
@@ -114,7 +91,42 @@ function joinCodes(arr?: string[]): string {
   return (arr || []).join("\n");
 }
 
-/** Lê e migra jogos do localStorage */
+function normalizeGameTitleForMerge(name: string): string {
+  let n = (name || "").trim();
+  n = n.replace(/\s+/g, " ");
+  n = n.replace(/\s*\((?:jogo|conta|account|acc|slot)\s*\d+\)\s*$/i, "");
+  n = n.replace(/\s*(?:-|#)\s*\d+\s*$/i, "");
+  return n.trim();
+}
+
+function normalizeHeader(h: string): string {
+  return (h || "")
+    .toString()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^\w_]/g, "");
+}
+
+function derivarNomeJogo(mapped: Record<string, any>): string {
+  const candidatos = [
+    mapped.jogo,
+    mapped.jogos,
+    mapped.produto,
+    mapped.product,
+    mapped.descricao,
+    mapped.item,
+    mapped.game,
+    mapped.nome_do_jogo,
+    mapped.titulo,
+    mapped.nome,
+  ];
+  const hit = candidatos.find((x) => String(x || "").trim() !== "");
+  return String(hit || "").trim();
+}
+
 export function getJogosFromStorage(): Jogo[] {
   try {
     const raw = localStorage.getItem(JOGOS_STORAGE_KEY);
@@ -135,7 +147,6 @@ export function getJogosFromStorage(): Jogo[] {
         sku_ps5s: normalizeSku(j.sku_ps5s),
       };
 
-      // MIGRAÇÃO: contas -> garantir ativacoes[] e plataforma
       const jaTemContas = Array.isArray(j.contas);
       if (jaTemContas) {
         (base as any).contas = (j.contas as any[]).map((c: any) => {
@@ -148,16 +159,14 @@ export function getJogosFromStorage(): Jogo[] {
             nick: String(c.nick || ""),
             senha: String(c.senha || ""),
             ativacoes: listaAtiv,
-            ativacao: undefined, // legado não mais usado
+            ativacao: undefined,
             midia: (c.midia === "PRIMARIA" || c.midia === "SECUNDARIA") ? c.midia : "PRIMARIA",
-            // >>> se não existir plataforma, define um default seguro (PS5)
             plataforma: (c.plataforma === "PS4" || c.plataforma === "PS5" || c.plataforma === "PS4s" || c.plataforma === "PS5s")
               ? (c.plataforma as PlataformaConta)
               : "PS5",
           } as ContaJogo;
         });
       } else {
-        // Se vierem campos legados soltos, cria a primeira conta
         const temLegado =
           (j.email && String(j.email).trim()) ||
           (j.nick && String(j.nick).trim()) ||
@@ -175,12 +184,11 @@ export function getJogosFromStorage(): Jogo[] {
               (Number(j.ps4 || 0) + Number(j.ps5 || 0)) >= (Number(j.ps4s || 0) + Number(j.ps5s || 0))
                 ? "PRIMARIA"
                 : "SECUNDARIA",
-            plataforma: "PS5", // >>> default na criação a partir do legado
+            plataforma: "PS5",
           } as ContaJogo];
         }
       }
 
-      // LEGADO: se houver um `codes` por jogo, apenas mantemos para referência (não é mais usado)
       if (Array.isArray(j.codes)) {
         (base as any).codes = splitCodes(j.codes);
       }
@@ -194,14 +202,12 @@ export function getJogosFromStorage(): Jogo[] {
   }
 }
 
-/** Persiste lista e avisa quem estiver ouvindo. */
 export function setJogosToStorage(lista: Jogo[]) {
   localStorage.setItem(JOGOS_STORAGE_KEY, JSON.stringify(lista));
   try { window.dispatchEvent(new CustomEvent("zion:jogos-updated")); } catch {}
   try { window.dispatchEvent(new Event("zion.jogos:refresh")); } catch {}
 }
 
-/** Procura por um SKU em qualquer coluna */
 export function findJogoBySku(
   skuRaw: string
 ): { jogo: Jogo; plataforma: PlataformaKey } | null {
@@ -217,23 +223,18 @@ export function findJogoBySku(
   return null;
 }
 
-/** Existe SKU? */
 export function skuExists(skuRaw: string): boolean {
   return !!findJogoBySku(skuRaw);
 }
 
-/* ======== NOVOS HELPERS EXPORTADOS — códigos por CONTA ======== */
-
-/** Encontra a CONTA de um jogo a partir do SKU + Mídia (útil para outra tela) */
+/* ======== códigos por CONTA ======== */
 export function findContaBySkuAndMidia(skuRaw: string, midia: Midia): { jogo: Jogo; conta: ContaJogo } | null {
   const hit = findJogoBySku(skuRaw);
   if (!hit) return null;
   const contas = hit.jogo.contas || [];
-  const conta = contas.find(c => c.midia === midia) || contas[0]; // fallback se só houver uma
+  const conta = contas.find(c => c.midia === midia) || contas[0];
   return conta ? { jogo: hit.jogo, conta } : null;
 }
-
-/** Pré-visualiza o PRÓXIMO código disponível por CONTA (sem consumir) */
 export function previewNextCodeForAccount(contaId: string): string | undefined {
   const lista = getJogosFromStorage();
   for (const j of lista) {
@@ -242,8 +243,6 @@ export function previewNextCodeForAccount(contaId: string): string | undefined {
   }
   return undefined;
 }
-
-/** Consome (remove) o PRÓXIMO código por CONTA e retorna o valor */
 export function consumeNextCodeForAccount(contaId: string): string | undefined {
   const lista = getJogosFromStorage();
   for (let i = 0; i < lista.length; i++) {
@@ -268,8 +267,6 @@ export function consumeNextCodeForAccount(contaId: string): string | undefined {
   }
   return undefined;
 }
-
-/** Helpers por SKU + Mídia */
 export function previewNextCodeBySkuAndMidia(skuRaw: string, midia: Midia): string | undefined {
   const hit = findContaBySkuAndMidia(skuRaw, midia);
   if (!hit) return undefined;
@@ -281,8 +278,6 @@ export function consumeNextCodeBySkuAndMidia(skuRaw: string, midia: Midia): stri
   return consumeNextCodeForAccount(hit.conta.id);
 }
 
-/* ======== HELPER DE CONTAGEM SOLICITADO ======== */
-/** Conta quantas CONTAS são válidas (email + senha + pelo menos 1 código) */
 function contasValidas(j: Jogo): number {
   const contas = j.contas || [];
   return contas.filter(c =>
@@ -293,21 +288,242 @@ function contasValidas(j: Jogo): number {
 }
 
 /* ============================================================
+   Importação Excel (flexível)
+   ============================================================ */
+type ExcelRow = Record<string, any>;
+
+const HEADER_MAP: Record<string, string> = {
+  jogo: "jogo",
+  jogos: "jogo",
+  nome: "jogo",
+  titulo: "jogo",
+  produto: "jogo",
+  product: "jogo",
+  descricao: "jogo",
+  item: "jogo",
+  game: "jogo",
+  nome_do_jogo: "jogo",
+
+  data: "data",
+  date: "data",
+  dt: "data",
+
+  valor: "valor",
+  preco: "valor",
+  price: "valor",
+
+  ps4: "ps4",
+  ps5: "ps5",
+  ps4s: "ps4s",
+  ps5s: "ps5s",
+  ps4_primaria: "ps4",
+  ps5_primaria: "ps5",
+  ps4_secundaria: "ps4s",
+  ps5_secundaria: "ps5s",
+  qtd_ps4: "ps4",
+  qtd_ps5: "ps5",
+  qtd_ps4s: "ps4s",
+  qtd_ps5s: "ps5s",
+  quantidade_ps4: "ps4",
+  quantidade_ps5: "ps5",
+  quantidade_ps4s: "ps4s",
+  quantidade_ps5s: "ps5s",
+
+  sku_ps4: "sku_ps4",
+  sku_ps5: "sku_ps5",
+  sku_ps4s: "sku_ps4s",
+  sku_ps5s: "sku_ps5s",
+  sku: "sku_ps5",
+
+  email: "email",
+  nick: "nick",
+  senha: "senha",
+  ativacoes: "ativacoes",
+  ativacao: "ativacoes",
+  codigos: "ativacoes",
+  codes: "ativacoes",
+
+  midia: "midia",
+  plataforma: "plataforma",
+
+  cod: "cod",
+  codigo: "cod",
+};
+
+function normalizeDateCell(v: any): string {
+  if (!v && v !== 0) return new Date().toISOString().slice(0, 10);
+  if (typeof v === "number") {
+    const d = XLSX.SSF.parse_date_code(v);
+    if (d) {
+      const dt = new Date(Date.UTC(d.y, (d.m ?? 1) - 1, d.d ?? 1));
+      return dt.toISOString().slice(0, 10);
+    }
+  }
+  const s = String(v).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (m) {
+    const dd = m[1].padStart(2, "0");
+    const mm = m[2].padStart(2, "0");
+    const yyyy = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return new Date().toISOString().slice(0, 10);
+}
+
+function toNumber(n: any): number {
+  if (n === null || n === undefined || n === "") return 0;
+  const x = Number(String(n).replace(",", "."));
+  return isNaN(x) ? 0 : x;
+}
+
+function excelRowToJogo(row: ExcelRow): Partial<Jogo> & { contas?: ContaJogo[] } {
+  const mapped: Record<string, any> = {};
+  Object.entries(row).forEach(([key, val]) => {
+    const norm = normalizeHeader(key);
+    const target = HEADER_MAP[norm] ?? norm;
+    mapped[target] = val;
+  });
+
+  const jogoNomeOriginal = derivarNomeJogo(mapped) || "(Sem nome)";
+  const jogoNome = normalizeGameTitleForMerge(jogoNomeOriginal);
+
+  const data = normalizeDateCell(mapped.data);
+  const valor = toNumber(mapped.valor);
+
+  const ps4 = toNumber(mapped.ps4);
+  const ps5 = toNumber(mapped.ps5);
+  const ps4s = toNumber(mapped.ps4s);
+  const ps5s = toNumber(mapped.ps5s);
+
+  const sku_ps4 = normalizeSku(mapped.sku_ps4);
+  const sku_ps5 = normalizeSku(mapped.sku_ps5);
+  const sku_ps4s = normalizeSku(mapped.sku_ps4s);
+  const sku_ps5s = normalizeSku(mapped.sku_ps5s);
+
+  const email = String(mapped.email || "").trim();
+  const nick = String(mapped.nick || "").trim();
+  const senha = String(mapped.senha || "").trim();
+  const ativacoes = splitCodes(mapped.ativacoes);
+
+  let midia: Midia = "PRIMARIA";
+  const m = String(mapped.midia || "").trim().toUpperCase();
+  if (m === "SECUNDARIA") midia = "SECUNDARIA";
+
+  let plataforma: PlataformaConta = "PS5";
+  const p = String(mapped.plataforma || "").trim().toUpperCase();
+  if (p === "PS4" || p === "PS5" || p === "PS4S" || p === "PS5S") {
+    plataforma = p as PlataformaConta;
+  }
+
+  const contas: ContaJogo[] =
+    email || nick || senha || (ativacoes?.length ?? 0) > 0
+      ? [{ id: uid(), email, nick, senha, ativacoes, midia, plataforma }]
+      : [];
+
+  return {
+    cod: 0,
+    data,
+    jogo: jogoNome,
+    valor,
+    ps4, ps5, ps4s, ps5s,
+    sku_ps4, sku_ps5, sku_ps4s, sku_ps5s,
+    contas,
+  };
+}
+
+function upsertJogo(
+  base: Jogo[],
+  incoming: Partial<Jogo> & { contas?: ContaJogo[] }
+): { lista: Jogo[]; created: boolean; updated: boolean } {
+  const skus = ["sku_ps4", "sku_ps5", "sku_ps4s", "sku_ps5s"] as const;
+  const incSkus = skus.map(k => normalizeSku((incoming as any)[k] || "")).filter(Boolean);
+
+  let idx = -1;
+
+  if (incSkus.length) {
+    idx = base.findIndex(j =>
+      incSkus.some(sku =>
+        normalizeSku(j.sku_ps4) === sku ||
+        normalizeSku(j.sku_ps5) === sku ||
+        normalizeSku(j.sku_ps4s) === sku ||
+        normalizeSku(j.sku_ps5s) === sku
+      )
+    );
+  }
+
+  const incNomeNorm = normalizeGameTitleForMerge(String(incoming.jogo || ""));
+  if (idx < 0 && incNomeNorm && incNomeNorm !== "(Sem nome)") {
+    idx = base.findIndex(j =>
+      normalizeGameTitleForMerge(j.jogo).toLowerCase() === incNomeNorm.toLowerCase()
+    );
+  }
+
+  const preferExistingSku = (curr?: string, inc?: string) =>
+    (curr && normalizeSku(curr)) || normalizeSku(inc || "") || "";
+
+  if (idx < 0) {
+    const novo: Jogo = {
+      id: uid(),
+      cod: 0,
+      data: incoming.data || new Date().toISOString().slice(0, 10),
+      jogo: incNomeNorm || "(Sem nome)",
+      valor: Number(incoming.valor || 0),
+      ps4: Number(incoming.ps4 || 0),
+      ps5: Number(incoming.ps5 || 0),
+      ps4s: Number(incoming.ps4s || 0),
+      ps5s: Number(incoming.ps5s || 0),
+      sku_ps4: normalizeSku((incoming as any).sku_ps4),
+      sku_ps5: normalizeSku((incoming as any).sku_ps5),
+      sku_ps4s: normalizeSku((incoming as any).sku_ps4s),
+      sku_ps5s: normalizeSku((incoming as any).sku_ps5s),
+      contas: incoming.contas || [],
+    };
+    return { lista: [...base, novo], created: true, updated: false };
+  }
+
+  const atual = base[idx];
+  const soma = (a?: number, b?: number) => (Number(a || 0) + Number(b || 0));
+  const contasMerged =
+    (incoming.contas && incoming.contas.length)
+      ? [...(atual.contas || []), ...incoming.contas]
+      : (atual.contas || []);
+
+  const atualizado: Jogo = {
+    ...atual,
+    jogo: normalizeGameTitleForMerge(String(atual.jogo || incNomeNorm || "(Sem nome)")),
+    data: atual.data || (incoming.data ? String(incoming.data) : atual.data),
+    valor: atual.valor && atual.valor !== 0 ? atual.valor : (incoming.valor !== undefined ? Number(incoming.valor) : atual.valor),
+
+    ps4: soma(atual.ps4, incoming.ps4),
+    ps5: soma(atual.ps5, incoming.ps5),
+    ps4s: soma(atual.ps4s, incoming.ps4s),
+    ps5s: soma(atual.ps5s, incoming.ps5s),
+
+    sku_ps4: preferExistingSku(atual.sku_ps4, (incoming as any).sku_ps4),
+    sku_ps5: preferExistingSku(atual.sku_ps5, (incoming as any).sku_ps5),
+    sku_ps4s: preferExistingSku(atual.sku_ps4s, (incoming as any).sku_ps4s),
+    sku_ps5s: preferExistingSku(atual.sku_ps5s, (incoming as any).sku_ps5s),
+
+    contas: contasMerged,
+  };
+
+  const nova = [...base];
+  nova[idx] = atualizado;
+  return { lista: nova, created: false, updated: true };
+}
+
+/* ============================================================
    Componente
    ============================================================ */
 export function JogosPage() {
   const [lista, setLista] = useState<Jogo[]>(() => getJogosFromStorage());
   const [busca, setBusca] = useState("");
 
-  // Ref com a última lista salva para evitar loop de refresh
   const listaRef = useRef<Jogo[]>(lista);
   useEffect(() => { listaRef.current = lista; }, [lista]);
 
-  // formulário de novo registro
-  const [form, setForm] = useState<Omit<Jogo, "id" | "cod" | "codes"> & {
-    /** LEGADO: cria 1ª conta com ativacoes derivadas de 'ativacao' se vier preenchido */
-    codes_text?: string; // descontinuado — mantido só para não quebrar imports antigos
-  }>({
+  const [form, setForm] = useState<Omit<Jogo, "id" | "cod" | "codes"> & { codes_text?: string }>({
     data: new Date().toISOString().slice(0, 10),
     jogo: "",
     valor: 0,
@@ -318,23 +534,20 @@ export function JogosPage() {
     email: "",
     nick: "",
     senha: "",
-    ativacao: "", // vai virar ativacoes[] da 1ª conta se informado
+    ativacao: "",
     sku_ps4: "",
     sku_ps5: "",
     sku_ps4s: "",
     sku_ps5s: "",
-    codes_text: "", // ignorado
+    codes_text: "",
   });
 
-  // edição inline
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editRow, setEditRow] = useState<(Omit<Jogo, "cod">) | null>(null);
 
-  // modal de contas
   const [modalJogoId, setModalJogoId] = useState<string | null>(null);
   const jogoModal = useMemo(() => lista.find(j => j.id === modalJogoId) || null, [lista, modalJogoId]);
 
-  // form de nova conta (no modal)
   const [novaConta, setNovaConta] = useState<ContaJogo>({
     id: "",
     email: "",
@@ -342,21 +555,18 @@ export function JogosPage() {
     senha: "",
     ativacoes: [],
     midia: "PRIMARIA",
-    plataforma: "PS5", // >>> default ao adicionar
+    plataforma: "PS5",
   });
   const [novaContaAtivacoesText, setNovaContaAtivacoesText] = useState<string>("");
 
-  // edição de conta (no modal)
   const [editContaId, setEditContaId] = useState<string | null>(null);
   const [editConta, setEditConta] = useState<ContaJogo | null>(null);
   const [editContaAtivText, setEditContaAtivText] = useState<string>("");
 
-  // salva quando muda
   useEffect(() => {
     setJogosToStorage(lista);
   }, [lista]);
 
-  // ouve mudanças feitas por OUTRAS telas
   useEffect(() => {
     const onRefresh = () => {
       const incoming = getJogosFromStorage();
@@ -381,14 +591,11 @@ export function JogosPage() {
         j.sku_ps4, j.sku_ps5, j.sku_ps4s, j.sku_ps5s,
       ].filter(Boolean).map(String);
 
-      // inclui busca nas contas e nos códigos
       const camposContas = (j.contas || []).flatMap(c => [
-        c.email, c.nick, c.senha, ...(c.ativacoes || []), c.midia, c.plataforma // >>> inclui plataforma na busca
+        c.email, c.nick, c.senha, ...(c.ativacoes || []), c.midia, c.plataforma
       ]).filter(Boolean).map(String);
 
-      // LEGADO (se ainda existir codes no jogo)
       const camposCodesJogo = (j.codes || []);
-
       const todos = [...camposBase, ...camposContas, ...camposCodesJogo].join("|").toLowerCase();
       return todos.includes(q);
     });
@@ -427,16 +634,16 @@ export function JogosPage() {
         email: String(form.email || ""),
         nick: String(form.nick || ""),
         senha: String(form.senha || ""),
-        ativacoes: splitCodes(form.ativacao), // MIGRA imediato
+        ativacoes: splitCodes(form.ativacao),
         midia: "PRIMARIA",
-        plataforma: "PS5", // >>> default quando vindo do legado do formulário rápido
+        plataforma: "PS5",
       });
     }
 
-    const novo: Jogo = {
+    const incoming: Jogo = {
       id: uid(),
       cod: 0,
-      jogo: form.jogo,
+      jogo: normalizeGameTitleForMerge(form.jogo),
       data: form.data,
       valor: Number(form.valor) || 0,
       ps4: Number(form.ps4) || 0,
@@ -450,7 +657,8 @@ export function JogosPage() {
       contas: contasIniciais.length ? contasIniciais : [],
     };
 
-    const atualizada = recomputarCod([...lista, novo]);
+    const { lista: mesclada } = upsertJogo(lista, incoming);
+    const atualizada = recomputarCod(mesclada);
     setLista(atualizada);
     limparForm();
   }
@@ -468,6 +676,13 @@ export function JogosPage() {
     }
   }
 
+  function excluirTudo() {
+    if (!lista.length) return;
+    if (!confirm(`Tem certeza que deseja excluir TODOS os ${lista.length} registros? Esta ação não pode ser desfeita.`)) return;
+    setLista([]);
+    setJogosToStorage([]);
+  }
+
   function iniciarEdicao(j: Jogo) {
     setEditingId(j.id);
     const { cod, ...resto } = j;
@@ -478,7 +693,6 @@ export function JogosPage() {
     setEditRow(null);
   }
 
-  /** NOVO: setter prático para SKUs em edição */
   function setEditSku(
     k: "sku_ps4" | "sku_ps5" | "sku_ps4s" | "sku_ps5s",
     v: string
@@ -489,7 +703,6 @@ export function JogosPage() {
   function salvarEdicao() {
     if (!editingId || !editRow) return;
 
-    // impedir salvar se houver SKU duplicado
     const keys = ["sku_ps4","sku_ps5","sku_ps4s","sku_ps5s"] as const;
     for (const k of keys) {
       const val = normalizeSku((editRow as any)?.[k] || "");
@@ -503,6 +716,7 @@ export function JogosPage() {
       ...(editRow as any),
       id: editingId,
       cod: 0,
+      jogo: normalizeGameTitleForMerge((editRow as any).jogo || ""),
       valor: Number((editRow as any).valor) || 0,
       ps4: Number((editRow as any).ps4) || 0,
       ps5: Number((editRow as any).ps5) || 0,
@@ -515,11 +729,166 @@ export function JogosPage() {
       contas: (editRow as any).contas || [],
     };
 
-    const nova = lista.map((j) => (j.id === editingId ? normalizada : j));
-    const atualizada = recomputarCod(nova);
+    const semAtual = lista.filter((j) => j.id !== editingId);
+    const { lista: mesclada } = upsertJogo(semAtual, normalizada);
+    const atualizada = recomputarCod(mesclada);
     setLista(atualizada);
     setEditingId(null);
     setEditRow(null);
+  }
+
+  /* ----------------- IMPORTAÇÃO EXCEL ----------------- */
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  function abrirFilePicker() {
+    fileInputRef.current?.click();
+  }
+
+  function lerCabecalhosDaPlanilha(sheet: XLSX.WorkSheet): string[] {
+    const AOA = XLSX.utils.sheet_to_json<string[]>(sheet, { header: 1, blankrows: false });
+    const headerRow = Array.isArray(AOA) && AOA.length ? AOA[0] : [];
+    return (headerRow as any[]).map((h) => String(h ?? "").trim()).filter(Boolean);
+  }
+
+  function validarCabecalhos(headersRaw: string[]): {
+    ok: boolean;
+    mapeados: string[];
+    normalizados: string[];
+    avisoSemNome: boolean;
+  } {
+    const normalizados = headersRaw.map(normalizeHeader);
+    const mapeados = normalizados.map((h) => HEADER_MAP[h] || h);
+
+    const camposUteis = ["jogo","jogos","ps4","ps5","ps4s","ps5s","valor","data","email","senha","nick","ativacoes","sku_ps4","sku_ps5","sku_ps4s","sku_ps5s"];
+    const temAlgumUtil = camposUteis.some((c) => mapeados.includes(c) || normalizados.includes(c));
+
+    const avisoSemNome = !mapeados.includes("jogo") &&
+                         !["sku_ps4","sku_ps5","sku_ps4s","sku_ps5s"].some(c => mapeados.includes(c));
+
+    return { ok: temAlgumUtil, mapeados, normalizados, avisoSemNome };
+  }
+
+  async function onImportFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    try {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+
+      const data = await file.arrayBuffer();
+      const workbook = XLSX.read(data, { type: "array" });
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+      if (!sheet) {
+        alert("Não encontrei nenhuma planilha no arquivo.");
+        return;
+      }
+
+      const headersRaw = lerCabecalhosDaPlanilha(sheet);
+      if (!headersRaw.length) {
+        alert("Planilha sem cabeçalho. Inclua uma linha de títulos (ex.: Jogos, Data, Valor, PS4, PS5...).");
+        return;
+      }
+
+      const ver = validarCabecalhos(headersRaw);
+      if (!ver.ok) {
+        alert(
+          "Importação cancelada: não encontrei colunas úteis (ex.: Jogos/Jogo, PS4/PS5/PS4s/PS5s, Valor, Data, Email/Senha, ou SKUs).\n" +
+          "Ajuste a planilha e tente novamente."
+        );
+        console.warn("[Importação] Colunas detectadas:", headersRaw);
+        return;
+      }
+
+      if (ver.avisoSemNome) {
+        console.info(
+          "%cImportação: prosseguindo sem coluna de Nome/Jogo nem SKUs — os registros podem ficar '(Sem nome)'.",
+          "color:#a67c00"
+        );
+      }
+
+      const rows: ExcelRow[] = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      let created = 0;
+      let updated = 0;
+      let errors = 0;
+      let ignored = 0;
+      let semNome = 0;
+
+      let base = [...lista];
+
+      for (const row of rows) {
+        try {
+          const partial = excelRowToJogo(row);
+
+          const hasQuant = (partial.ps4 ?? 0) + (partial.ps5 ?? 0) + (partial.ps4s ?? 0) + (partial.ps5s ?? 0) > 0;
+          const hasValor = typeof partial.valor === "number" && !Number.isNaN(partial.valor) && partial.valor !== 0;
+          const hasConta = (partial.contas && partial.contas.length > 0);
+          const hasSku = !!(
+            normalizeSku((partial as any).sku_ps4) ||
+            normalizeSku((partial as any).sku_ps5) ||
+            normalizeSku((partial as any).sku_ps4s) ||
+            normalizeSku((partial as any).sku_ps5s)
+          );
+          const hasNome = String(partial.jogo || "").trim() !== "";
+
+          if (!hasQuant && !hasValor && !hasConta && !hasSku && !hasNome) {
+            ignored += 1;
+            continue;
+          }
+
+          if (!hasNome) semNome += 1;
+
+          const { lista: merged, created: c, updated: u } = upsertJogo(base, partial);
+          base = merged;
+          if (c) created += 1;
+          if (u) updated += 1;
+        } catch (err) {
+          errors += 1;
+        }
+      }
+
+      const finalList = recomputarCod(base);
+      setLista(finalList);
+      setJogosToStorage(finalList);
+
+      console.groupCollapsed(
+        `%cImportação Excel: ${file.name}`,
+        "color:#0a7b5f;font-weight:600;"
+      );
+      console.log("Colunas (originais):", headersRaw);
+      console.log("Colunas (normalizadas):", ver.normalizados);
+      console.log("Colunas (mapeadas):", ver.mapeados);
+      console.log("Itens criados:", created);
+      console.log("Itens atualizados:", updated);
+      console.log("Linhas ignoradas (vazias):", ignored);
+      console.log("Linhas sem nome (importadas como '(Sem nome)'):", semNome);
+      console.log("Linhas com erro:", errors);
+      console.groupEnd();
+
+      if (created === 0 && updated === 0) {
+        alert(
+          `Nada a importar de "${file.name}".\n` +
+          `Vazias/ignoradas: ${ignored}\n` +
+          `Erros: ${errors}\n` +
+          `Dica: preencha ao menos Quantidades, Valor, Dados de Conta ou SKUs.`
+        );
+      } else {
+        const extra =
+          semNome > 0
+            ? `\n• ${semNome} registro(s) ficaram com nome "(Sem nome)" — você pode editar depois.`
+            : "";
+        alert(
+          `Importação finalizada de "${file.name}":\n` +
+          `• Criados: ${created}\n` +
+          `• Atualizados: ${updated}\n` +
+          `• Ignorados (vazios): ${ignored}\n` +
+          `• Linhas com erro: ${errors}` +
+          extra
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Falha ao importar o arquivo. Verifique o formato (.xls, .xlsx ou .csv) e tente novamente.");
+    }
   }
 
   /* ----------------- MODAL CONTAS ----------------- */
@@ -532,7 +901,7 @@ export function JogosPage() {
       senha: "",
       ativacoes: [],
       midia: "PRIMARIA",
-      plataforma: "PS5", // >>> default ao abrir modal
+      plataforma: "PS5",
     });
     setNovaContaAtivacoesText("");
     setEditContaId(null);
@@ -559,7 +928,6 @@ export function JogosPage() {
       : j
     );
     setLista(recomputarCod(atualizada));
-    // limpa form
     setNovaConta({ id: "", email: "", nick: "", senha: "", ativacoes: [], midia: "PRIMARIA", plataforma: "PS5" });
     setNovaContaAtivacoesText("");
   }
@@ -604,17 +972,46 @@ export function JogosPage() {
   /* ----------------- RENDER ----------------- */
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-xl font-semibold text-slate-900">Jogos</h1>
+      {/* HEADER */}
+      <div className="flex flex-col gap-2">
+        <h1 className="text-lg sm:text-xl font-semibold text-slate-900">Jogos</h1>
         <p className="text-slate-600 text-sm">
-          Cadastre os jogos. O <b>COD</b> é gerado automaticamente conforme a ordem alfabética do campo <b>Jogo</b>.
-          Os campos <b>PS4/PS5/PS4s/PS5s</b> representam <b>quantidade</b> (0 = não possui).<br />
-          Agora, os <b>códigos de ativação</b> ficam <b>dentro de cada conta</b> (aba “Contas → Ativações”), um por linha.
-          Outras telas podem consumir o próximo código por <b>conta</b> ou por <b>SKU + mídia</b>.
+          Cadastre os jogos. O <b>COD</b> é gerado automaticamente pela ordem alfabética de <b>Jogo</b>.
+          Os campos <b>PS4/PS5/PS4s/PS5s</b> são <b>quantidades</b>. Códigos ficam nas <b>Contas → Ativações</b>.
         </p>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={abrirFilePicker}
+            className="rounded-lg bg-emerald-600 text-white px-4 py-2 hover:bg-emerald-700 transition"
+            title="Importar a planilha exportada do Access (xlsx/xls/csv)"
+          >
+            Importar Excel (Access)
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            className="hidden"
+            onChange={onImportFileChange}
+          />
+          <span className="text-xs text-slate-500">
+            Aceita .xlsx, .xls ou .csv. SKUs podem ficar em branco; “Jogos” é aceito como nome.
+          </span>
+
+          <button
+            type="button"
+            onClick={excluirTudo}
+            className="md:ml-auto rounded-lg bg-rose-600 text-white px-4 py-2 hover:bg-rose-700 transition"
+            title="Excluir todos os registros"
+          >
+            Excluir tudo
+          </button>
+        </div>
       </div>
 
-      {/* Busca */}
+      {/* BUSCA */}
       <div className="flex flex-col md:flex-row gap-2 md:items-center">
         <input
           value={busca}
@@ -625,12 +1022,12 @@ export function JogosPage() {
         <div className="text-sm text-slate-500">{filtrada.length} registro(s)</div>
       </div>
 
-      {/* Formulário de cadastro */}
+      {/* FORM */}
       <form
         onSubmit={adicionar}
         className="bg-white rounded-2xl shadow-card border border-slate-100 p-4 space-y-4"
       >
-        <div className="grid md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <div>
             <label className="text-sm block mb-1">Data</label>
             <input
@@ -664,8 +1061,7 @@ export function JogosPage() {
           </div>
         </div>
 
-        {/* Quantidades */}
-        <div className="grid md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <div>
             <label className="text-sm block mb-1">PS4 (primária) – Qtde</label>
             <input
@@ -708,8 +1104,7 @@ export function JogosPage() {
           </div>
         </div>
 
-        {/* Credenciais iniciais (opcional) */}
-        <div className="grid md:grid-cols-5 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
           <div>
             <label className="text-sm block mb-1">E-mail (conta) — opcional</label>
             <input
@@ -746,12 +1141,11 @@ export function JogosPage() {
             />
           </div>
           <div className="self-end text-xs text-slate-500">
-            Se preencher, será criada a 1ª conta (mídia PRIMÁRIA) com esses códigos.
+            Se preencher, cria a 1ª conta (PRIMÁRIA) com esses códigos.
           </div>
         </div>
 
-        {/* SKUs */}
-        <div className="grid md:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
           <div>
             <label className="text-sm block mb-1">SKU_PS4</label>
             <input
@@ -790,7 +1184,7 @@ export function JogosPage() {
           </div>
         </div>
 
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <button className="rounded-lg bg-brand-600 text-white px-4 py-2 hover:bg-brand-700 transition">
             Adicionar
           </button>
@@ -804,8 +1198,154 @@ export function JogosPage() {
         </div>
       </form>
 
-      {/* Tabela */}
-      <div className="bg-white rounded-2xl shadow-card border border-slate-100 overflow-x-auto">
+      {/* ======= LISTA MOBILE (cards) ======= */}
+      <div className="md:hidden space-y-2">
+        {filtrada.length === 0 ? (
+          <div className="bg-white rounded-xl border border-slate-200 p-4 text-slate-500 text-center">
+            Nenhum registro.
+          </div>
+        ) : (
+          filtrada.map((j) => {
+            const emEdicao = editingId === j.id;
+            const contas = j.contas || [];
+            const totalContasValid = contasValidas(j);
+            const totalCodes = contas.reduce((acc, c) => acc + (c.ativacoes?.length || 0), 0);
+            const preview = contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0];
+
+            return (
+              <div key={j.id} className="bg-white rounded-xl border border-slate-200 p-3">
+                {/* header */}
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-xs text-slate-500">COD {j.cod} • {j.data}</div>
+                    {!emEdicao ? (
+                      <div className="font-medium text-slate-900 truncate">{j.jogo}</div>
+                    ) : (
+                      <input
+                        value={(editRow as any)?.jogo || ""}
+                        onChange={(e) => setEditRow((r) => (r ? { ...r, jogo: e.target.value } : r))}
+                        className="border rounded px-2 py-1 w-full"
+                        placeholder="Nome do jogo"
+                      />
+                    )}
+                  </div>
+
+                  <div className="flex gap-2">
+                    {!emEdicao ? (
+                      <>
+                        <button onClick={() => abrirModal(j)} className="text-brand-700 text-xs underline">Contas</button>
+                        <button onClick={() => iniciarEdicao(j)} className="text-brand-700 text-xs underline">Editar</button>
+                        <button onClick={() => remover(j.id)} className="text-rose-600 text-xs underline">Excluir</button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={salvarEdicao} className="text-brand-700 text-xs underline">Salvar</button>
+                        <button onClick={cancelarEdicao} className="text-slate-600 text-xs underline">Cancelar</button>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* corpo */}
+                <div className="mt-2 grid grid-cols-2 gap-2 text-sm">
+                  <div>
+                    <div className="text-slate-500">Valor</div>
+                    {!emEdicao ? (
+                      <div className="font-medium">
+                        {j.valor?.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}
+                      </div>
+                    ) : (
+                      <input
+                        type="number" step="0.01" min="0"
+                        value={(editRow as any)?.valor ?? 0}
+                        onChange={(e) => setEditRow((r) => (r ? { ...r, valor: Number(e.target.value) } : r))}
+                        className="border rounded px-2 py-1 w-full"
+                      />
+                    )}
+                  </div>
+
+                  <div>
+                    <div className="text-slate-500">Quantidades</div>
+                    {!emEdicao ? (
+                      <div className="font-medium text-xs">
+                        PS4 {j.ps4} • PS5 {j.ps5} • PS4s {j.ps4s} • PS5s {j.ps5s}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-4 gap-1">
+                        {(["ps4","ps5","ps4s","ps5s"] as const).map(k => (
+                          <input
+                            key={k}
+                            type="number" min={0}
+                            value={(editRow as any)?.[k] ?? 0}
+                            onChange={(e) =>
+                              setEditRow((r) =>
+                                r ? ({ ...r, [k]: Number(e.target.value) } as any) : r
+                              )
+                            }
+                            className="border rounded px-2 py-1"
+                            placeholder={k.toUpperCase()}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="col-span-2">
+                    <div className="text-slate-500">SKUs</div>
+                    {!emEdicao ? (
+                      <div className="text-xs font-medium space-y-0.5">
+                        {j.sku_ps4 && <div>PS4: {j.sku_ps4}</div>}
+                        {j.sku_ps5 && <div>PS5: {j.sku_ps5}</div>}
+                        {j.sku_ps4s && <div>PS4s: {j.sku_ps4s}</div>}
+                        {j.sku_ps5s && <div>PS5s: {j.sku_ps5s}</div>}
+                        {!j.sku_ps4 && !j.sku_ps5 && !j.sku_ps4s && !j.sku_ps5s && <div>—</div>}
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        {(
+                          [
+                            ["PS4","sku_ps4"],
+                            ["PS5","sku_ps5"],
+                            ["PS4s","sku_ps4s"],
+                            ["PS5s","sku_ps5s"],
+                          ] as const
+                        ).map(([label,key]) => {
+                          const curr = (editRow as any)?.[key] ?? "";
+                          const dup = skuDuplicadoNoContexto(lista, editingId, key as any, curr);
+                          return (
+                            <div key={key} className="flex items-center gap-2">
+                              <span className="text-xs w-12 shrink-0 text-slate-600">{label}:</span>
+                              <input
+                                value={curr}
+                                onChange={(e) => setEditSku(key as any, e.target.value)}
+                                className="border rounded px-2 py-1 w-full"
+                                placeholder={`EAFC26-${label}-P`}
+                              />
+                              {curr && dup && (
+                                <span className="text-[11px] text-amber-700">já existe</span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="col-span-2">
+                    <div className="text-slate-500">Contas & Códigos</div>
+                    <div className="text-xs text-slate-700">
+                      Contas válidas: <b>{totalContasValid}</b> • Códigos: <b>{totalCodes}</b> • Próximo: <i>{preview || "—"}</i>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+      {/* ======= TABELA DESKTOP ======= */}
+      <div className="hidden md:block bg-white rounded-2xl shadow-card border border-slate-100 overflow-x-auto">
         <table className="min-w-full text-sm">
           <thead className="bg-slate-50 text-slate-700">
             <tr>
@@ -827,21 +1367,13 @@ export function JogosPage() {
             {filtrada.map((j) => {
               const emEdicao = editingId === j.id;
               const contas = j.contas || [];
-
-              // total de CONTAS VÁLIDAS (email + senha + >=1 código)
               const totalContasValid = contasValidas(j);
-
-              // somatório de códigos disponíveis
               const totalCodes = contas.reduce((acc, c) => acc + (c.ativacoes?.length || 0), 0);
-
-              // preview: primeiro código encontrado
-              const preview =
-                contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0] ?? undefined;
+              const preview = contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0] ?? undefined;
 
               return (
                 <tr key={j.id} className="border-t">
                   <td className="px-3 py-2">{j.cod}</td>
-
                   <td className="px-3 py-2">
                     {emEdicao ? (
                       <input
@@ -850,11 +1382,8 @@ export function JogosPage() {
                         onChange={(e) => setEditRow((r) => (r ? { ...r, data: e.target.value } : r))}
                         className="border rounded px-2 py-1"
                       />
-                    ) : (
-                      j.data
-                    )}
+                    ) : (j.data)}
                   </td>
-
                   <td className="px-3 py-2">
                     {emEdicao ? (
                       <input
@@ -862,11 +1391,8 @@ export function JogosPage() {
                         onChange={(e) => setEditRow((r) => (r ? { ...r, jogo: e.target.value } : r))}
                         className="border rounded px-2 py-1 w-56"
                       />
-                    ) : (
-                      j.jogo
-                    )}
+                    ) : (j.jogo)}
                   </td>
-
                   <td className="px-3 py-2 text-right">
                     {emEdicao ? (
                       <input
@@ -880,7 +1406,6 @@ export function JogosPage() {
                     )}
                   </td>
 
-                  {/* Quantidades */}
                   {(["ps4","ps5","ps4s","ps5s"] as const).map((k) => (
                     <td key={k} className="px-3 py-2 text-center">
                       {emEdicao ? (
@@ -894,13 +1419,10 @@ export function JogosPage() {
                           }
                           className="border rounded px-2 py-1 w-16 text-center"
                         />
-                      ) : (
-                        (j as any)[k] || 0
-                      )}
+                      ) : ((j as any)[k] || 0)}
                     </td>
                   ))}
 
-                  {/* SKUs (editáveis quando em edição) */}
                   <td className="px-3 py-2 align-top">
                     {!emEdicao ? (
                       <div className="flex flex-col text-xs text-slate-700">
@@ -921,21 +1443,20 @@ export function JogosPage() {
                           ] as const
                         ).map(([label, key]) => {
                           const curr = (editRow as any)?.[key] ?? "";
-                          const dup = skuDuplicadoNoContexto(lista, editingId, key, curr);
+                          const dup = skuDuplicadoNoContexto(lista, editingId, key as any, curr);
                           return (
                             <div key={key} className="flex items-center gap-2">
                               <span className="w-12 shrink-0 text-slate-600">{label}:</span>
                               <input
                                 value={curr}
-                                onChange={(e) => setEditSku(key, e.target.value)}
+                                onChange={(e) => setEditSku(key as any, e.target.value)}
                                 placeholder={`ex.: EAFC26-${label}-P`}
                                 className="border rounded px-2 py-1 w-56"
                               />
-                              {/* botão limpar/apagar */}
                               {curr ? (
                                 <button
                                   type="button"
-                                  onClick={() => setEditSku(key, "")}
+                                  onClick={() => setEditSku(key as any, "")}
                                   className="text-rose-600 hover:underline"
                                   title="Apagar este SKU"
                                 >
@@ -944,7 +1465,6 @@ export function JogosPage() {
                               ) : (
                                 <span className="text-slate-400">novo</span>
                               )}
-                              {/* alerta de duplicidade (somente se houver valor) */}
                               {curr && dup && (
                                 <span className="text-amber-600" title="Este SKU já existe em outro jogo">
                                   • já existe em outro jogo
@@ -953,23 +1473,18 @@ export function JogosPage() {
                             </div>
                           );
                         })}
-                        <div className="text-[11px] text-slate-500 mt-1">
-                          Dica: deixe em branco para remover um SKU. Eles serão salvos ao clicar em <b>Salvar</b>.
-                        </div>
                       </div>
                     )}
                   </td>
 
-                  {/* RESUMO (Contas & Códigos) */}
                   <td className="px-3 py-2 align-top">
                     <div className="text-xs text-slate-700 space-y-0.5">
-                      <div>Contas válidas (e-mail + senha + código): <b>{totalContasValid}</b></div>
-                      <div>Códigos disponíveis (todas as contas): <b>{totalCodes}</b></div>
-                      <div className="text-slate-500 mt-1">Próximo código (preview): <i>{preview || "—"}</i></div>
+                      <div>Contas válidas: <b>{totalContasValid}</b></div>
+                      <div>Códigos disponíveis: <b>{totalCodes}</b></div>
+                      <div className="text-slate-500 mt-1">Próximo: <i>{preview || "—"}</i></div>
                     </div>
                   </td>
 
-                  {/* Botão para abrir pop-up de contas */}
                   <td className="px-3 py-2">
                     <button
                       onClick={() => abrirModal(j)}
@@ -979,7 +1494,6 @@ export function JogosPage() {
                     </button>
                   </td>
 
-                  {/* Ações */}
                   <td className="px-3 py-2 text-right">
                     {!emEdicao ? (
                       <div className="flex gap-3 justify-end">
@@ -1035,22 +1549,22 @@ export function JogosPage() {
             if (e.target === e.currentTarget) fecharModal();
           }}
         >
-          <div className="w-full max-w-6xl bg-white rounded-2xl shadow-xl border border-slate-200 p-4">
-            <div className="flex items-start justify-between gap-4 mb-3">
-              <div>
-                <h3 className="text-lg font-semibold text-slate-900">
+          <div className="relative bg-white rounded-2xl shadow-xl border border-slate-200 p-4
+                          w-[calc(100vw-1.5rem)] sm:w-[95vw] max-w-6xl max-h-[85vh] overflow-auto">
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 mb-3">
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-slate-900 truncate">
                   Contas — {jogoModal.jogo}
                 </h3>
                 <p className="text-slate-600 text-sm">
                   Em cada conta, insira os códigos no campo <b>Ativações</b> (um por linha).
                 </p>
               </div>
-              <button onClick={fecharModal} className="text-slate-600 hover:text-slate-800">
-                fechar ✕
+              <button onClick={fecharModal} className="self-start sm:self-auto rounded-lg border px-3 py-1.5 hover:bg-slate-50">
+                Fechar
               </button>
             </div>
 
-            {/* Lista de contas */}
             <div className="overflow-x-auto mb-4">
               <table className="min-w-full text-sm">
                 <thead className="bg-slate-50 text-slate-700">
@@ -1060,7 +1574,6 @@ export function JogosPage() {
                     <th className="text-left px-3 py-2">Senha</th>
                     <th className="text-left px-3 py-2">Ativações</th>
                     <th className="text-left px-3 py-2">Mídia</th>
-                    {/* >>> NOVA COLUNA: Versão/Plataforma */}
                     <th className="text-left px-3 py-2">Versão</th>
                     <th className="text-right px-3 py-2">Ações</th>
                   </tr>
@@ -1102,7 +1615,6 @@ export function JogosPage() {
                           ) : c.senha || "—"}
                         </td>
 
-                        {/* Ativações por conta */}
                         <td className="px-3 py-2">
                           {!emEdicao ? (
                             <div className="text-xs text-slate-700 space-y-1">
@@ -1122,7 +1634,6 @@ export function JogosPage() {
                           )}
                         </td>
 
-                        {/* Mídia PRIMÁRIA/SECUNDÁRIA */}
                         <td className="px-3 py-2">
                           {emEdicao ? (
                             <select
@@ -1146,7 +1657,6 @@ export function JogosPage() {
                           )}
                         </td>
 
-                        {/* >>> NOVO: Versão/Plataforma por conta */}
                         <td className="px-3 py-2">
                           {emEdicao ? (
                             <select
@@ -1205,10 +1715,9 @@ export function JogosPage() {
               </table>
             </div>
 
-            {/* Adicionar nova conta */}
             <div className="border-t pt-4">
               <h4 className="font-medium text-slate-900 mb-2">Adicionar conta</h4>
-              <div className="grid md:grid-cols-6 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
                 <input
                   placeholder="E-mail"
                   value={novaConta.email}
@@ -1242,7 +1751,6 @@ export function JogosPage() {
                   <option value="PRIMARIA">Primária</option>
                   <option value="SECUNDARIA">Secundária</option>
                 </select>
-                {/* >>> NOVO: seletor de versão ao adicionar conta */}
                 <select
                   value={novaConta.plataforma}
                   onChange={(e) => setNovaConta((c) => ({ ...c, plataforma: e.target.value as PlataformaConta }))}

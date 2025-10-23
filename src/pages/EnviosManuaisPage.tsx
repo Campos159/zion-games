@@ -2,7 +2,8 @@
 
 // src/pages/EnviosManuaisPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { iniciarEnvio, type FulfillmentPayload } from "../services/fulfillment";
+// import { iniciarEnvio, type FulfillmentPayload } from "../services/fulfillment";
+import { enviarItemEmail } from "../services/email";
 
 // IMPORT ROBUSTO DO SERVICE DE JOGOS (com fallback em runtime)
 import * as JogosSvc from "../services/jogos";
@@ -28,14 +29,15 @@ function midiaFromVariant(v: Variante): Midia {
 type SkuStatus = "idle" | "loading" | "success" | "notfound" | "error";
 
 type ItemForm = {
+  itemId?: number;
   sku: string;
   qty: number;
   name: string;
-  variant: Variante;          // variação por item (botões)
-  variant_name: string;       // ex.: PlayStation 4 / 5
+  variant: Variante;
+  variant_name: string;
   login: string;
-  senhaRaw: string;           // "s1/s2" -> enviamos sempre a 2ª
-  codigo: string;             // preview antes; definitivo após consumo
+  senhaRaw: string;
+  codigo: string;
 };
 
 // Tipos do service de jogos (do namespace)
@@ -46,7 +48,7 @@ type Draft = {
   items: ItemForm[];
   nomeCliente: string;
   email: string;
-  phone: string; // armazenado já “mascarado”
+  phone: string;
   viaWhatsapp: boolean;
   viaEmail: boolean;
   autocompletarPorSku: boolean;
@@ -58,7 +60,7 @@ function defaultVariantName(v: Variante): string {
   return v.includes("PS5") ? "PlayStation 5" : "PlayStation 4";
 }
 
-/** Sempre retorna a 2ª senha: se "a/b" -> "b". Se só tem uma, retorna a própria. */
+/** Sempre retorna a 2ª senha */
 function senha2(raw: string): string {
   if (!raw) return "";
   const s = String(raw).trim();
@@ -75,19 +77,11 @@ function clsx(...xs: Array<string | false | null | undefined>) {
 
 /* ========== Telefone ========== */
 function onlyDigits(v: string) { return (v || "").replace(/\D+/g, ""); }
-
-/**
- * Máscara BR local: (DD) XXXX-XXXX ou (DD) 9XXXX-XXXX
- * - Entrada: qualquer coisa; mantém só dígitos (até 11)
- * - Saída: SEM +55 (apenas (ddd) número)
- */
 function maskPhoneStrict(v: string) {
   const d = onlyDigits(v).slice(0, 11);
   if (!d) return "";
-
   const dd = d.slice(0, 2);
   const rest = d.slice(2);
-
   if (d.length <= 2) return `(${dd}`;
   if (d.length <= 10) {
     if (rest.length <= 4) return `(${dd}) ${rest}`;
@@ -112,7 +106,6 @@ function emailValido(v: string) {
 type ToastType = "success" | "error" | "info";
 type Toast = { id: string; type: ToastType; msg: string };
 const TOAST_TTL = 3500;
-
 function uid() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
 /* ================== Mapeamentos ================== */
@@ -123,13 +116,10 @@ const platToVariante: Record<Plataforma, Variante> = {
   PS5s: "PS5 Secundária",
 };
 
-/* ======= n8n Webhook (compatível CRA/Webpack/Vite) ======= */
+/* ======= n8n Webhook (mantido, não usado) ======= */
 const N8N_WEBHOOK_URL: string | undefined =
-  // CRA/Webpack (REACT_APP_)
   (typeof process !== "undefined" && (process as any)?.env?.REACT_APP_N8N_WEBHOOK_URL) ||
-  // Vite (VITE_)
   (typeof process !== "undefined" && (process as any)?.env?.VITE_N8N_WEBHOOK_URL) ||
-  // fallback runtime via window
   (typeof window !== "undefined" && (window as any).__N8N_WEBHOOK_URL__) ||
   undefined;
 
@@ -170,7 +160,7 @@ export default function EnviosManuaisPage() {
   // -------- Estado principal (com rascunho)
   const [orderId, setOrderId] = useState("");
   const [items, setItems] = useState<ItemForm[]>([
-    { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+    { itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
   ]);
   const [nomeCliente, setNomeCliente] = useState("");
   const [email, setEmail] = useState("");
@@ -180,12 +170,12 @@ export default function EnviosManuaisPage() {
   const [viaEmail, setViaEmail] = useState(true);
   const [autocompletarPorSku, setAutocompletarPorSku] = useState(true);
 
-  // status/controle por item
+  // status por item
   const [skuStatus, setSkuStatus] = useState<Record<number, SkuStatus>>({});
   const [skuErrorMsg, setSkuErrorMsg] = useState<Record<number, string>>({});
   const [skuDetected, setSkuDetected] = useState<Record<number, JogoPorSku | null>>({});
   const debounceTimers = useRef<Record<number, number>>({});
-  const lastSearchedSku = useRef<Record<number, string>>({}); // evita buscas duplicadas
+  const lastSearchedSku = useRef<Record<number, string>>({});
 
   /* ---------- RASCUNHO: carregar ---------- */
   useEffect(() => {
@@ -199,9 +189,10 @@ export default function EnviosManuaisPage() {
           d.items && d.items.length
             ? d.items
             : [
-                { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+                { itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
               ]
         ).map((it) => ({
+          itemId: it.itemId,
           sku: (it.sku || "").toUpperCase(),
           qty: Number(it.qty || 1),
           name: it.name || "",
@@ -252,7 +243,7 @@ export default function EnviosManuaisPage() {
   function limparRascunho() {
     try { localStorage.removeItem(DRAFT_KEY); } catch {}
     setOrderId("");
-    setItems([{ sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" }]);
+    setItems([{ itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" }]);
     setNomeCliente("");
     setEmail("");
     setPhoneMask("");
@@ -270,7 +261,7 @@ export default function EnviosManuaisPage() {
   function addItem() {
     setItems((prev) => [
       ...prev,
-      { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+      { itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
     ]);
   }
   function removeItem(ix: number) {
@@ -286,20 +277,17 @@ export default function EnviosManuaisPage() {
     setItems((prev) => prev.map((it, i) => (i === ix ? { ...it, ...patch } : it)));
   }
 
-  // Quando troca a variação manualmente, já atualiza o preview correto para a nova mídia
   async function onChooseVariant(ix: number, v: Variante) {
     updateItem(ix, {
       variant: v,
       variant_name: items[ix].variant_name?.trim() ? items[ix].variant_name : defaultVariantName(v),
     });
 
-    // Rebusa o preview por SKU + nova mídia (se SKU estiver preenchido)
     const sku = items[ix].sku.trim().toUpperCase();
     if (autocompletarPorSku && sku) {
       try {
         const midia = midiaFromVariant(v);
         let codigoPreview = "";
-
         if (typeof (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia === "function") {
           const r = await (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia(sku, midia);
           codigoPreview = r?.codigo || "";
@@ -310,15 +298,12 @@ export default function EnviosManuaisPage() {
           const j = await (JogosSvc as any).buscarJogoPorSku(sku);
           codigoPreview = j?.codigo_preview || "";
         }
-
         if (codigoPreview) updateItem(ix, { codigo: codigoPreview });
-      } catch {
-        // silencioso
-      }
+      } catch {}
     }
   }
 
-  /* ---------- Busca SKU (sem botão) ---------- */
+  /* ---------- Busca SKU ---------- */
   async function fetchSku(ix: number, force = false) {
     const raw = items[ix]?.sku ?? "";
     const sku = raw.trim().toUpperCase().replace(/\s+/g, "");
@@ -327,13 +312,12 @@ export default function EnviosManuaisPage() {
       setSkuDetected((s) => ({ ...s, [ix]: null }));
       return;
     }
-    if (!force && lastSearchedSku.current[ix] === sku) return; // evita repetição
+    if (!force && lastSearchedSku.current[ix] === sku) return;
     lastSearchedSku.current[ix] = sku;
 
     setSkuStatus((s) => ({ ...s, [ix]: "loading" }));
     setSkuErrorMsg((s) => ({ ...s, [ix]: "" }));
     try {
-      // 1) Busca metadados do jogo pelo SKU
       const jogo = await (JogosSvc as any).buscarJogoPorSku(sku);
       if (!jogo) {
         setSkuStatus((s) => ({ ...s, [ix]: "notfound" }));
@@ -342,13 +326,11 @@ export default function EnviosManuaisPage() {
         return;
       }
 
-      // 2) Descobre variante conforme console + mídia
       const sug: Variante =
         jogo.console === "PS4"
           ? (jogo.tipo_midia.toLowerCase().includes("sec") ? "PS4 Secundária" : "PS4 Primária")
           : (jogo.tipo_midia.toLowerCase().includes("sec") ? "PS5 Secundária" : "PS5 Primária");
 
-      // 3) Aplica dados básicos no item
       updateItem(ix, {
         variant: sug,
         variant_name: defaultVariantName(sug),
@@ -357,10 +339,8 @@ export default function EnviosManuaisPage() {
         senhaRaw: jogo.senha ? senha2(jogo.senha) : items[ix].senhaRaw,
       });
 
-      // 4) Busca o CÓDIGO correto no estoque via SKU + MÍDIA (sem consumir)
       const midia = midiaFromVariant(sug);
       let codigoReal = "";
-
       if (typeof (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia === "function") {
         const r = await (JogosSvc as any).buscarCodigoDisponivelPorSkuEMidia(sku, midia);
         codigoReal = r?.codigo || "";
@@ -370,7 +350,6 @@ export default function EnviosManuaisPage() {
       } else {
         codigoReal = jogo.codigo_preview || "";
       }
-
       updateItem(ix, { codigo: codigoReal });
 
       setSkuDetected((s) => ({ ...s, [ix]: jogo }));
@@ -393,7 +372,6 @@ export default function EnviosManuaisPage() {
     if (existing) window.clearTimeout(existing);
     debounceTimers.current[ix] = window.setTimeout(() => fetchSku(ix), 350);
   }
-
   function onPasteSku(ix: number, e: React.ClipboardEvent<HTMLInputElement>) {
     const pasted = e.clipboardData.getData("text");
     if (!pasted) return;
@@ -404,8 +382,6 @@ export default function EnviosManuaisPage() {
     if (existing) window.clearTimeout(existing);
     debounceTimers.current[ix] = window.setTimeout(() => fetchSku(ix, true), 100);
   }
-
-  /* Busca também no onBlur para garantir */
   function onBlurSku(ix: number) {
     const t = debounceTimers.current[ix];
     if (t) window.clearTimeout(t);
@@ -456,12 +432,9 @@ export default function EnviosManuaisPage() {
 
   const pedidoAtual = useMemo(() => {
     if (!orderId) return null;
-    return (
-      pedidos.find((p) => String(p.codigo || p.id) === String(orderId).trim()) || null
-    );
+    return pedidos.find((p) => String(p.codigo || p.id) === String(orderId).trim()) || null;
   }, [orderId, pedidos]);
 
-  // util: limpa controles/timers de SKU quando trocamos todo o conjunto de itens
   function resetSkuControls() {
     Object.values(debounceTimers.current).forEach((t) => { if (t) window.clearTimeout(t as any); });
     debounceTimers.current = {};
@@ -482,6 +455,7 @@ export default function EnviosManuaisPage() {
       const mapped: ItemForm[] = rows.map((r) => {
         const variante = platToVariante[r.plataforma as Plataforma] || "PS5 Primária";
         return {
+          itemId: r.id,
           sku: (r.sku || "").toUpperCase(),
           qty: Number(r.quantidade || 1),
           name: r.nome_produto || "",
@@ -497,7 +471,7 @@ export default function EnviosManuaisPage() {
 
       setOrderId(String(p.codigo || p.id));
       setItems(mapped.length ? mapped : [
-        { sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+        { itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
       ]);
       setNomeCliente(p.cliente_nome || "");
       setEmail(p.cliente_email || "");
@@ -533,17 +507,13 @@ export default function EnviosManuaisPage() {
     const d = onlyDigits(phoneMask);
     if (d.length < 8) return "Telefone muito curto. Informe ao menos 8 dígitos.";
     if (!viaWhatsapp && !viaEmail) return "Selecione pelo menos um canal (WhatsApp ou E-mail).";
-
-    // exigir pedido pago
     if (pedidoAtual && !/pago|paid/i.test(String(pedidoAtual.status || ""))) {
       return "O pedido selecionado ainda não está pago.";
     }
     return null;
   }
 
-  /* --- Disparo automático de busca por SKU ao montar e quando SKUs mudarem --- */
   const skusSignature = useMemo(() => items.map(it => it.sku?.trim().toUpperCase() || "").join("|"), [items]);
-
   useEffect(() => {
     items.forEach((it, ix) => {
       const sku = (it.sku || "").trim();
@@ -565,168 +535,60 @@ export default function EnviosManuaisPage() {
       const err = validar();
       if (err) throw new Error(err);
 
-      const payload: FulfillmentPayload = {
-        triggered_by: "admin_zion",
-        order: {
-          order_id: orderId.trim(),
-          sale_channel: "site",
-          items: items.map((it) => ({
-            sku: it.sku.trim(),
-            qty: it.qty,
-            name: it.name.trim(),
-            variant_name: it.variant_name.trim(),
-            credentials: {
-              login: it.login.trim(),
-              senha: senha2(it.senhaRaw),
-              codigo: it.codigo.trim(), // preview (antes do consumo)
-              variant: it.variant,
-            },
-          })),
-          customer: {
-            name: nomeCliente.trim(),
-            email: email.trim(),
-            phone_e164: `+55${onlyDigits(phoneMask)}`,
-            // compat legado
-            login: items[0]?.login?.trim() || "",
-            senha: senha2(items[0]?.senhaRaw || ""),
-            codigo: items[0]?.codigo?.trim() || "",
-            nome_jogo: items[0]?.name?.trim() || "",
-          },
-        },
-        options: {
-          send_via: [
-            ...(viaWhatsapp ? (["whatsapp"] as const) : []),
-            ...(viaEmail ? (["email"] as const) : []),
-          ],
-          deadline_minutes: 15,
-        },
-        metadata: {
-          ui_note: "Envio manual pelo painel",
-          source: "zion-admin",
-          credentials_by_item: items.map((it) => ({
-            sku: it.sku,
-            login: it.login.trim(),
-            senha: senha2(it.senhaRaw),
-            codigo: it.codigo.trim(),
-            variant: it.variant,
-            name: it.name.trim(),
-          })),
-        },
-      };
-
-      const res = await iniciarEnvio(payload);
-      setOk(res?.ok ?? false);
-
-      if (!res?.ok) {
-        showToast("error", "Falha ao disparar o envio. Nenhum código foi consumido.");
-        setErro("Falha ao disparar o envio.");
-        return;
+      const semId = items.findIndex(it => !it.itemId);
+      if (semId !== -1) {
+        throw new Error(`O item #${semId + 1} não possui itemId. Carregue o pedido pela coluna à esquerda para enviar.`);
       }
-
-      showToast("success", "Envio disparado com sucesso. Consumindo códigos…");
-
-      // Após envio OK: consumir 1 código por item (SKU + MÍDIA) com fallback e preparar payload do webhook.
-      const itensFinal: Array<{
-        sku: string;
-        qty: number;
-        name: string;
-        variant_name: string;
-        midia: Midia;
-        credentials: { login: string; senha: string; codigo: string; variant: Variante };
-      }> = [];
 
       for (let i = 0; i < items.length; i++) {
-        try {
-          const skuBase = items[i].sku.trim().toUpperCase();
-          const midia = midiaFromVariant(items[i].variant);
+        const it = items[i];
+        const payload = {
+          item_id: it.itemId!,
+          destinatario: email.trim(),
+          cliente_nome: nomeCliente.trim(),
+          pedido_codigo: orderId.trim(),
+          jogo: (it.name || "").trim(),
+          login: (it.login || "").trim(),
+          senha: senha2(it.senhaRaw || ""),
+          codigo: (it.codigo || "").trim(),
+        };
 
-          let codigoConsumido: string | undefined;
-          if (typeof (JogosSvc as any).consumirCodigoPorSkuEMidia === "function") {
-            const r = await (JogosSvc as any).consumirCodigoPorSkuEMidia(skuBase, midia);
-            codigoConsumido = r?.codigo;
-          } else if (typeof (JogosSvc as any).consumirCodigoPorSku === "function") {
-            const r = await (JogosSvc as any).consumirCodigoPorSku(skuBase);
-            codigoConsumido = r?.codigo;
-          } else {
-            throw new Error("Serviço de consumo de código não disponível.");
+        try {
+          await enviarItemEmail(payload);
+          showToast("success", `E-mail do item #${i + 1} enviado para ${email}`);
+
+          try {
+            const midia = midiaFromVariant(it.variant);
+            const consumo = await (JogosSvc as any).consumirCodigoPorSkuEMidia(it.sku, midia);
+            const codigoConsumido = consumo?.codigo;
+            setItems((prev) =>
+              prev.map((x, ix) =>
+                ix === i ? { ...x, codigo: codigoConsumido || x.codigo } : x
+              )
+            );
+            showToast(
+              codigoConsumido ? "info" : "error",
+              codigoConsumido
+                ? `Código consumido para ${it.sku}: ${codigoConsumido}`
+                : `Nenhum código disponível para consumo em ${it.sku}`
+            );
+          } catch (consErr) {
+            console.error("Falha ao consumir o código:", consErr);
+            showToast("error", "Falha ao consumir o código após o envio.");
           }
-
-          if (!codigoConsumido) throw new Error("Sem código disponível para este SKU.");
-
-          updateItem(i, { codigo: codigoConsumido });
-          itensFinal.push({
-            sku: skuBase,
-            qty: items[i].qty,
-            name: items[i].name.trim(),
-            variant_name: items[i].variant_name.trim(),
-            midia,
-            credentials: {
-              login: items[i].login.trim(),
-              senha: senha2(items[i].senhaRaw),
-              codigo: codigoConsumido,
-              variant: items[i].variant,
-            },
-          });
-
-          showToast("success", `Código consumido (${skuBase}/${midia}): ${codigoConsumido}`);
         } catch (e: any) {
-          showToast("error", `Falha ao consumir código do item #${i + 1}: ${e?.message || "erro"}`);
+          showToast("error", `Falha no item #${i + 1}: ${e?.message || "erro"}`);
+          throw e;
         }
       }
 
-      // Disparo do webhook para n8n — somente se houver URL configurada
-      if (N8N_WEBHOOK_URL) {
-        try {
-          const body = {
-            event: "fulfillment_ok",
-            source: "zion-admin",
-            timestamp: new Date().toISOString(),
-            order: {
-              id: payload.order.order_id,
-              status: pedidoAtual?.status || "desconhecido",
-              paid: pedidoAtual ? isPago(pedidoAtual.status) : true,
-              sale_channel: payload.order.sale_channel,
-            },
-            customer: {
-              name: nomeCliente.trim(),
-              email: email.trim(),
-              phone_local: phoneMask,
-              phone_e164: `+55${onlyDigits(phoneMask)}`,
-            },
-            options: {
-              send_via: payload.options?.send_via || [],
-              deadline_minutes: payload.options?.deadline_minutes,
-            },
-            items: itensFinal.length
-              ? itensFinal
-              : items.map((it) => ({
-                  sku: it.sku.trim().toUpperCase(),
-                  qty: it.qty,
-                  name: it.name.trim(),
-                  variant_name: it.variant_name.trim(),
-                  midia: midiaFromVariant(it.variant),
-                  credentials: {
-                    login: it.login.trim(),
-                    senha: senha2(it.senhaRaw),
-                    codigo: it.codigo.trim(),
-                    variant: it.variant,
-                  },
-                })),
-          };
-
-          await postToWebhook(N8N_WEBHOOK_URL, body);
-          showToast("success", "Dados enviados ao n8n ✅");
-        } catch (e: any) {
-          showToast("error", `Webhook n8n falhou: ${e?.message || "erro"}`);
-        }
-      } else {
-        console.warn("N8N webhook não configurado — defina REACT_APP_N8N_WEBHOOK_URL, VITE_N8N_WEBHOOK_URL ou window.__N8N_WEBHOOK_URL__.");
-      }
+      setOk(true);
+      setErro(null);
+      showToast("success", "Todos os e-mails foram enfileirados e códigos consumidos ✅");
     } catch (e: any) {
-      console.error("Disparar Envio:", e);
-      const msg = e?.message || "Erro inesperado";
-      setErro(msg);
+      const msg = e?.message || "Erro inesperado ao enviar os e-mails";
       setOk(false);
+      setErro(msg);
       showToast("error", msg);
     } finally {
       setLoading(false);
@@ -735,9 +597,9 @@ export default function EnviosManuaisPage() {
 
   /* ================== UI ================== */
   return (
-    <div className="p-6 max-w-7xl mx-auto">
-      {/* TOASTS */}
-      <div className="fixed top-4 right-4 z-50 space-y-2">
+    <div className="px-4 py-5 sm:p-6 max-w-7xl mx-auto">
+      {/* TOASTS (centraliza no mobile) */}
+      <div className="fixed top-4 left-4 right-4 sm:left-auto sm:right-4 z-50 space-y-2 sm:w-auto sm:max-w-sm">
         {toasts.map((t) => (
           <div
             key={t.id}
@@ -753,9 +615,10 @@ export default function EnviosManuaisPage() {
         ))}
       </div>
 
-      <div className="flex items-center justify-between mb-4">
-        <h1 className="text-2xl font-bold">Envios Manuais</h1>
-        <div className="flex items-center gap-3">
+      {/* HEADER */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <h1 className="text-xl sm:text-2xl font-bold">Envios Manuais</h1>
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <label className="inline-flex items-center gap-2 text-sm">
             <input
               type="checkbox"
@@ -772,42 +635,44 @@ export default function EnviosManuaisPage() {
             />
             Mostrar só pagos
           </label>
-          <button
-            className="px-3 py-2 rounded-2xl bg-slate-600 hover:bg-slate-700 text-white"
-            onClick={() => {
-              setOrderId("MANUAL-" + Math.floor(Math.random() * 99999));
-              setItems([
-                { sku: "EAFC25-PS5-PRI", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
-                { sku: "GOW-PS4-SEC", qty: 1, name: "", variant: "PS4 Secundária", variant_name: "PlayStation 4", login: "", senhaRaw: "", codigo: "" },
-              ]);
-              setNomeCliente("Fulano de Tal");
-              setEmail("fulano@exemplo.com");
-              setPhoneMask("(11) 98888-7777");
-              setViaWhatsapp(true);
-              setViaEmail(true);
-              setOk(null);
-              setErro(null);
-              setSkuStatus({});
-              setSkuDetected({});
-              setSkuErrorMsg({});
-              showToast("info", "Exemplo preenchido. Cole um SKU válido para autocompletar.");
-            }}
-            type="button"
-          >
-            Preencher Exemplo
-          </button>
-          <button
-            className="px-3 py-2 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white"
-            onClick={limparRascunho}
-            type="button"
-            title="Limpar rascunho local"
-          >
-            Limpar
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="px-3 py-2 rounded-xl bg-slate-600 hover:bg-slate-700 text-white text-sm"
+              onClick={() => {
+                setOrderId("MANUAL-" + Math.floor(Math.random() * 99999));
+                setItems([
+                  { itemId: undefined, sku: "EAFC25-PS5-PRI", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
+                  { itemId: undefined, sku: "GOW-PS4-SEC", qty: 1, name: "", variant: "PS4 Secundária", variant_name: "PlayStation 4", login: "", senhaRaw: "", codigo: "" },
+                ]);
+                setNomeCliente("Fulano de Tal");
+                setEmail("fulano@exemplo.com");
+                setPhoneMask("(11) 98888-7777)");
+                setViaWhatsapp(true);
+                setViaEmail(true);
+                setOk(null);
+                setErro(null);
+                setSkuStatus({});
+                setSkuDetected({});
+                setSkuErrorMsg({});
+                showToast("info", "Exemplo preenchido. Cole um SKU válido para autocompletar.");
+              }}
+              type="button"
+            >
+              Preencher Exemplo
+            </button>
+            <button
+              className="px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm"
+              onClick={limparRascunho}
+              type="button"
+              title="Limpar rascunho local"
+            >
+              Limpar
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* LAYOUT: coluna de pedidos + formulário */}
+      {/* LAYOUT: pedidos + formulário */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* ===== COLUNA DE PEDIDOS ===== */}
         <div className="lg:col-span-1">
@@ -826,7 +691,7 @@ export default function EnviosManuaisPage() {
               onChange={(e) => setBusca(e.target.value)}
             />
 
-            <div className="space-y-2 max-h-[540px] overflow-auto pr-1">
+            <div className="space-y-2 max-h-[45vh] sm:max-h-[540px] overflow-auto pr-1">
               {pedidosOrdenados.map((p) => (
                 <button
                   key={p.id}
@@ -835,10 +700,10 @@ export default function EnviosManuaisPage() {
                   title="Carregar este pedido no formulário de envio"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <div className="font-semibold text-sm">{p.cliente_nome}</div>
+                    <div className="font-semibold text-sm truncate">{p.cliente_nome}</div>
                     <span
                       className={clsx(
-                        "text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border",
+                        "text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border shrink-0",
                         isPago(p.status)
                           ? "bg-emerald-100 text-emerald-800 border-emerald-200"
                           : "bg-amber-100 text-amber-800 border-amber-200"
@@ -865,18 +730,18 @@ export default function EnviosManuaisPage() {
         <div className="lg:col-span-2">
           {/* Pedido / Itens */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+            {/* Pedido */}
             <div className="p-4 rounded-2xl shadow bg-white/5 border border-white/10">
               <h2 className="font-semibold mb-3">Pedido</h2>
-
               <label className="text-sm">Order ID</label>
               <input className="w-full input" value={orderId} onChange={(e) => setOrderId(e.target.value)} />
 
               <div className="mt-4">
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
                   <h3 className="font-semibold">Itens</h3>
                   <button
                     type="button"
-                    className="px-3 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white"
+                    className="px-3 py-1 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm"
                     onClick={addItem}
                   >
                     + Adicionar Item
@@ -889,24 +754,26 @@ export default function EnviosManuaisPage() {
                   const err = skuErrorMsg[ix] || "";
                   return (
                     <div key={ix} className="p-3 rounded-xl bg-white/5 border border-white/10 mb-3">
-                      {/* VARIAÇÃO por item */}
+                      {/* VARIAÇÃO por item (rolável no mobile) */}
                       <div className="mb-2">
                         <div className="text-xs mb-1 opacity-90">Variação do item</div>
-                        <div className="inline-flex rounded-2xl overflow-hidden border border-white/15 bg-white/5">
-                          {variantes.map((v) => (
-                            <button
-                              type="button"
-                              key={v}
-                              className={clsx(
-                                "px-2.5 py-1.5 text-xs",
-                                v === it.variant ? "bg-indigo-600 text-white" : "hover:bg-white/10"
-                              )}
-                              onClick={() => onChooseVariant(ix, v)}
-                              title="Escolher variação deste item"
-                            >
-                              {v}
-                            </button>
-                          ))}
+                        <div className="relative -mx-1">
+                          <div className="flex gap-1 overflow-x-auto no-scrollbar px-1 py-0.5 snap-x snap-mandatory rounded-2xl border border-white/15 bg-white/5">
+                            {variantes.map((v) => (
+                              <button
+                                type="button"
+                                key={v}
+                                className={clsx(
+                                  "px-2.5 py-1.5 text-xs rounded-lg snap-start shrink-0",
+                                  v === it.variant ? "bg-indigo-600 text-white" : "hover:bg-white/10"
+                                )}
+                                onClick={() => onChooseVariant(ix, v)}
+                                title="Escolher variação deste item"
+                              >
+                                {v}
+                              </button>
+                            ))}
+                          </div>
                         </div>
                       </div>
 
@@ -1005,7 +872,7 @@ export default function EnviosManuaisPage() {
                             <div>Código (preview): <b>{items[ix].codigo || det.codigo_preview || "—"}</b></div>
                           </div>
                           <div className="mt-1 opacity-70">
-                            * O código só é <b>consumido</b> (removido da tabela) após o envio ser confirmado como <b>OK</b>.
+                            * O código só é <b>consumido</b> após o envio ser confirmado como <b>OK</b>.
                           </div>
                         </div>
                       )}
@@ -1014,7 +881,7 @@ export default function EnviosManuaisPage() {
                         <div className="mt-3 text-right">
                           <button
                             type="button"
-                            className="px-3 py-1 rounded-xl bg-rose-600 hover:bg-rose-700 text-white"
+                            className="px-3 py-1 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm"
                             onClick={() => removeItem(ix)}
                           >
                             Remover item
@@ -1052,18 +919,20 @@ export default function EnviosManuaisPage() {
           {/* Canais */}
           <div className="p-4 rounded-2xl shadow bg-white/5 border border-white/10 mb-4">
             <h2 className="font-semibold mb-3">Canais</h2>
-            <label className="inline-flex items-center gap-2 mr-6">
-              <input type="checkbox" checked={viaWhatsapp} onChange={(e) => setViaWhatsapp(e.target.checked)} />
-              <span>WhatsApp</span>
-            </label>
-            <label className="inline-flex items-center gap-2">
-              <input type="checkbox" checked={viaEmail} onChange={(e) => setViaEmail(e.target.checked)} />
-              <span>E-mail</span>
-            </label>
+            <div className="flex flex-wrap items-center gap-4">
+              <label className="inline-flex items-center gap-2">
+                <input type="checkbox" checked={viaWhatsapp} onChange={(e) => setViaWhatsapp(e.target.checked)} />
+                <span>WhatsApp</span>
+              </label>
+              <label className="inline-flex items-center gap-2">
+                <input type="checkbox" checked={viaEmail} onChange={(e) => setViaEmail(e.target.checked)} />
+                <span>E-mail</span>
+              </label>
+            </div>
           </div>
 
           <button
-            className="px-5 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white font-semibold disabled:opacity-60"
+            className="w-full sm:w-auto px-5 py-3 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white font-semibold disabled:opacity-60"
             onClick={onEnviar}
             disabled={loading}
           >
@@ -1076,7 +945,7 @@ export default function EnviosManuaisPage() {
         </div>
       </div>
 
-      {/* estilo mínimo para inputs */}
+      {/* estilo mínimo para inputs + no-scrollbar util */}
       <style>{`
         .input {
           background: rgba(99, 102, 241, 0.10);
@@ -1091,6 +960,8 @@ export default function EnviosManuaisPage() {
           box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
         }
         label { display:block; margin-bottom: 6px; opacity: .95 }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
       `}</style>
     </div>
   );

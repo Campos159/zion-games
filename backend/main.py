@@ -7,23 +7,24 @@ import hmac
 import uuid
 import hashlib
 import re
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, Iterable, List
 
 import urllib.request
 from urllib.error import URLError, HTTPError
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
-from . import schemas, crud, emailer
-from fastapi import FastAPI
-from api import yampi_webhook
-
+from . import schemas, crud
+from .settings import settings  # <- ÚNICA fonte de config
+from .email_templates import template_envio_item, subject_for
 
 
 # ======================================================
@@ -38,15 +39,9 @@ except Exception as e:
     HAS_PROMO_ROUTER = False
 
 # ---------------------------------------------------------------------
-# DB boot
-# ---------------------------------------------------------------------
-Base.metadata.create_all(bind=engine)
-
-# ---------------------------------------------------------------------
 # App + CORS
 # ---------------------------------------------------------------------
-app = FastAPI(title="Zion Admin API", version="0.5.1")
-app.include_router(yampi_webhook.router)
+app = FastAPI(title="Zion Admin API", version="0.6.2")
 
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
@@ -61,11 +56,104 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------
+# Email Client (SMTP)
+# ---------------------------------------------------------------------
+class EmailClient:
+    """Envio SMTP simples (STARTTLS por padrão)."""
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        use_tls: bool | None = None,
+        use_ssl: bool | None = None,
+        default_from: Optional[str] = None,
+    ):
+        self.host = host or settings.EMAIL_HOST
+        self.port = port or settings.EMAIL_PORT
+        self.username = username or str(settings.EMAIL_USERNAME)
+        # remove espaços por segurança (Gmail mostra com espaços no app password)
+        raw_pwd = password or settings.EMAIL_PASSWORD
+        self.password = str(raw_pwd).replace(" ", "")
+        self.use_tls = settings.EMAIL_USE_TLS if use_tls is None else use_tls
+        self.use_ssl = settings.EMAIL_USE_SSL if use_ssl is None else use_ssl
+        self.default_from = default_from or settings.EMAIL_FROM or self.username
+
+    def _connect(self) -> smtplib.SMTP:
+        if self.use_ssl:
+            smtp = smtplib.SMTP_SSL(self.host, self.port)
+        else:
+            smtp = smtplib.SMTP(self.host, self.port)
+        smtp.ehlo()
+        if self.use_tls and not self.use_ssl:
+            smtp.starttls()
+            smtp.ehlo()
+        if self.username and self.password:
+            smtp.login(self.username, self.password)
+        return smtp
+
+    @staticmethod
+    def _to_plain(html: str) -> str:
+        import re
+        return re.sub("<[^<]+?>", "", html)
+
+    def send_email(
+        self,
+        to: str | Iterable[str],
+        subject: str,
+        html: str,
+        text: Optional[str] = None,
+        cc: Optional[List[str]] = None,
+        bcc: Optional[List[str]] = None,
+        reply_to: Optional[str] = None,
+        from_addr: Optional[str] = None,
+    ) -> dict:
+        to_list = [to] if isinstance(to, str) else list(to)
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = from_addr or self.default_from
+        msg["To"] = ", ".join(to_list)
+        if cc:
+            msg["Cc"] = ", ".join(cc)
+        if reply_to:
+            msg["Reply-To"] = reply_to
+
+        if text:
+            msg.set_content(text)
+            msg.add_alternative(html, subtype="html")
+        else:
+            plain = self._to_plain(html)
+            msg.set_content(plain)
+            msg.add_alternative(html, subtype="html")
+
+        all_recipients = to_list + (cc or []) + (bcc or [])
+        with self._connect() as smtp:
+            result = smtp.send_message(msg, to_addrs=all_recipients)
+        # dict vazio == sucesso
+        return {"errors": result}
+
+email_client = EmailClient()
+
+# ---------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------
 @app.on_event("startup")
 async def _startup_notice():
     print("✅ Zion Admin API iniciada.")
-    print("   - Banco conectado.")
+    print("   - Banco conectando...")
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("   - Tabelas OK.")
+    except Exception as e:
+        print(f"   - ERRO ao criar tabelas: {e}")
     print(f"   - Rota /promocoes ativada: {HAS_PROMO_ROUTER}")
+    print("   - Banco conectado (ou em tentativa).")
+    print(f"   - BACKEND_BASE_URL = {settings.BACKEND_BASE_URL}")
+    print(f"   - EMAIL_USERNAME = {settings.EMAIL_USERNAME}")
+    print(f"   - EMAIL_FROM = {settings.EMAIL_FROM or settings.EMAIL_USERNAME}")
+    print(f"   - EMAIL_HOST/PORT/TLS = {settings.EMAIL_HOST}/{settings.EMAIL_PORT}/{settings.EMAIL_USE_TLS}")
 
 @app.get("/health")
 def health():
@@ -79,7 +167,6 @@ if HAS_PROMO_ROUTER:
 else:
     @app.get("/promocoes/listar")
     def _promocoes_mock():
-        """Mock simples para testar o front caso promocoes.py falhe"""
         return {
             "fonte": "mock",
             "promocoes": [
@@ -172,15 +259,17 @@ def _normalize_email_for_response(value) -> str:
     return f"{local}@{domain}"
 
 # =====================================================================
-# Configs de Integração (n8n + Yampi)
+# Configs de Integração (n8n + Yampi) — usando Settings
 # =====================================================================
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
-N8N_HMAC_SECRET = (os.getenv("N8N_HMAC_SECRET") or "").encode("utf-8")
-N8N_DRY_RUN = (os.getenv("N8N_DRY_RUN") or "").lower() in ("1", "true", "yes")
+N8N_WEBHOOK_URL = settings.N8N_WEBHOOK_URL
+N8N_HMAC_SECRET = (settings.N8N_HMAC_SECRET or "").encode("utf-8") if settings.N8N_HMAC_SECRET else b""
+N8N_DRY_RUN = bool(settings.N8N_DRY_RUN)
 
-YAMPI_API_BASE = os.getenv("YAMPI_API_BASE", "https://api.yampi.com.br/v1")
-YAMPI_API_TOKEN = os.getenv("YAMPI_API_TOKEN", "")
-YAMPI_WEBHOOK_SECRET = (os.getenv("YAMPI_WEBHOOK_SECRET") or "").encode("utf-8")
+BACKEND_BASE_URL = (settings.BACKEND_BASE_URL or "http://127.0.0.1:8000").rstrip("/")
+
+YAMPI_API_BASE = settings.YAMPI_API_BASE
+YAMPI_API_TOKEN = settings.YAMPI_API_TOKEN
+YAMPI_WEBHOOK_SECRET = (settings.YAMPI_WEBHOOK_SECRET or "").encode("utf-8") if settings.YAMPI_WEBHOOK_SECRET else b""
 
 _IDEM_CACHE: set[str] = set()
 
@@ -276,7 +365,6 @@ async def fulfillment_status(req: Request, db: Session = Depends(get_db)):
 # =====================================================================
 # Yampi: Webhook + Cliente de API + Estoque bidirecional
 # =====================================================================
-
 def _yampi_auth_headers() -> dict:
     if not YAMPI_API_TOKEN:
         raise HTTPException(status_code=500, detail="YAMPI_API_TOKEN ausente")
@@ -290,7 +378,7 @@ def _yampi_mark_delivered(order_id: str):
         print(f"[YAMPI] Falha ao marcar entregue {order_id}: {code} {j}")
 
 def _yampi_update_stock_by_sku(sku: str, quantity: int):
-    url = f"{YAMPI_API_BASE}/products/{sku}/stock"  # ajuste se necessário
+    url = f"{YAMPI_API_BASE}/products/{sku}/stock"
     body = {"quantity": int(quantity)}
     code, j = _http_json("PUT", url, body=body, headers=_yampi_auth_headers())
     if not (200 <= code < 300):
@@ -372,7 +460,8 @@ def _disparar_fulfillment_n8n(pedido: schemas.PedidoRead, itens: list[schemas.It
         "options": {"send_via": ["email"]},
         "metadata": {"source": "yampi"},
     }
-    code, j = _http_json("POST", "http://127.0.0.1:8000/fulfillment/create", body)
+    url = f"{settings.BACKEND_BASE_URL.rstrip('/')}/fulfillment/create"
+    code, j = _http_json("POST", url, body)
     if not (200 <= code < 300):
         print("[FULFILLMENT] Falha ao disparar:", code, j)
 
@@ -394,7 +483,7 @@ async def yampi_webhook(req: Request, db: Session = Depends(get_db)):
     if event in ("order.created", "order.paid"):
         codigo = str((order.get("code") or order.get("id") or "")).strip()
 
-        existing = None
+        existing = None  # sua busca se necessário
 
         if existing:
             ped_out = schemas.PedidoRead.model_validate(existing)
@@ -432,10 +521,6 @@ class StockPushPayload(BaseModel):
 def estoque_site_para_yampi(data: StockPushPayload):
     _yampi_update_stock_by_sku(data.sku, data.quantity)
     return {"ok": True}
-
-# =====================================================================
-# Rotas estáticas antes de dinâmicas (seu código original)
-# =====================================================================
 
 # ---------------------------------------------------------------------
 # Pedidos agrupados (tela "Pedidos Entregues")
@@ -646,18 +731,7 @@ def toggle_enviado(item_id: int, db: Session = Depends(get_db)):
     )
 
 # ---------------------------------------------------------------------
-# Venda (atalho: cria Pedido + 1 Item)
-# ---------------------------------------------------------------------
-@app.post("/vendas", response_model=schemas.VendaRead, status_code=201)
-def criar_venda(data: schemas.VendaCreate, db: Session = Depends(get_db)):
-    pedido, item = crud.criar_venda(db, data)
-    ped_out = schemas.PedidoRead.model_validate(pedido)
-    it_out = schemas.ItemRead.model_validate(item)
-    it_out.total_item = float((item.quantidade or 0) * float(item.preco_unitario or 0))
-    return {"pedido": ped_out, "item": it_out}
-
-# ---------------------------------------------------------------------
-# Emails: enviar por ITEM e marcar como enviado
+# Venda / Envio por e-mail (nativo, sem n8n)
 # ---------------------------------------------------------------------
 class SendItemPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -666,7 +740,7 @@ class SendItemPayload(BaseModel):
     cliente_nome: str = ""
     pedido_codigo: str | int | None = None
     jogo: str = ""
-    template_tipo: str = "PS4_Primaria"
+    template_tipo: str = "PS4_Primaria"  # mantido apenas por compat.
     login: Optional[str] = ""
     senha: Optional[str] = ""
     codigo: Optional[str] = ""
@@ -689,8 +763,31 @@ def _coerce_send_item_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         "codigo": pick("codigo", "codigo_ativacao", "code") or "",
     }
 
+def _send_email_item_sync(
+    to_email: str,
+    cliente_nome: str,
+    jogo: str,
+    plataforma_variacao: str,
+    login: str,
+    senha: str,
+    codigo: Optional[str],
+    subject: Optional[str] = None,
+) -> dict:
+    html = template_envio_item(
+        nome_cliente=cliente_nome or "",
+        nome_jogo=jogo or "",
+        plataforma_variacao=plataforma_variacao,
+        login=login or "",
+        senha=senha or "",
+        codigo=codigo or None,
+        observacoes_html=None,
+    )
+    subj = subject or subject_for(plataforma_variacao, jogo or "Seu jogo")
+    return email_client.send_email(to=to_email, subject=subj, html=html)
+
 @app.post("/emails/send-item")
-async def emails_send_item(request: Request, db: Session = Depends(get_db)):
+async def emails_send_item(request: Request, bg: BackgroundTasks, db: Session = Depends(get_db)):
+    # aceita JSON ou form-data, mantendo compatibilidade
     ct = (request.headers.get("content-type") or "").lower()
     if ct.startswith("application/json"):
         raw = await request.json()
@@ -720,25 +817,40 @@ async def emails_send_item(request: Request, db: Session = Depends(get_db)):
     if not to_email or "@" not in to_email:
         raise HTTPException(status_code=400, detail="destinatario inválido")
 
-    try:
-        msg = emailer.montar_email_entrega_item(
-            destinatario=to_email,
-            cliente_nome=payload["cliente_nome"] or "",
-            pedido_codigo=payload["pedido_codigo"] or item_id_int,
-            jogo=payload["jogo"] or "",
-            template_tipo=payload["template_tipo"] or "PS4_Primaria",
-            login=payload["login"] or "",
-            senha=payload["senha"] or "",
-            codigo=payload["codigo"] or "",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro ao montar e-mail: {e}")
-
-    result = emailer.send_email(msg)
-
-    upd = schemas.ItemUpdate(enviado=True, enviado_em=datetime.utcnow())
-    it = crud.atualizar_item(db, item_id_int, upd)
+    # Determina plataforma/variação visual do template com base no item
+    it = crud.obter_item(db, item_id_int)
     if not it:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+    plataforma_variacao = {
+        "PS4": "PS4 Secundária",
+        "PS4s": "PS4 Secundária",
+        "PS5": "PS5 Primária",
+        "PS5s": "PS5 Secundária",
+    }.get(_safe_platform(it.plataforma), "PS5 Primária")
+
+    # Dispara o envio em background
+    bg.add_task(
+        _send_email_item_sync,
+        to_email,
+        payload["cliente_nome"] or "",
+        payload["jogo"] or it.nome_produto or "",
+        plataforma_variacao,
+        payload["login"] or "",
+        payload["senha"] or "",
+        payload["codigo"] or "",
+        None,
+    )
+
+    # Marca como enviado
+    upd = schemas.ItemUpdate(enviado=True, enviado_em=datetime.utcnow())
+    it2 = crud.atualizar_item(db, item_id_int, upd)
+    if not it2:
         raise HTTPException(status_code=404, detail="Item não encontrado para marcar como enviado")
 
-    return {"ok": True, "email": result, "item_id": it.id, "enviado_em": _safe_datetime_str(it.enviado_em)}
+    return {
+        "ok": True,
+        "queued": True,
+        "item_id": it2.id,
+        "enviado_em": _safe_datetime_str(it2.enviado_em),
+        "to": to_email,
+    }
