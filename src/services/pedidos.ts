@@ -71,7 +71,7 @@ export type ItemUpdate = Partial<ItemCreate>;
 
 /* ===== Pedidos ===== */
 
-export async function listarPedidos(): Promise<PedidoRead[]> {
+export async function listarPedidos(p0: any): Promise<PedidoRead[]> {
   const { data } = await api.get<PedidoRead[]>("/pedidos");
   return data;
 }

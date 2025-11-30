@@ -79,6 +79,16 @@ export function Layout() {
               </Link>
             </li>
 
+            {/* 🆕 Histórico de Contas (desktop) */}
+            <li>
+              <Link
+                to="/historico-contas"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/historico-contas")}`}
+              >
+                Histórico de Contas
+              </Link>
+            </li>
+
             <li>
               <Link
                 to="/precificacao"
@@ -94,6 +104,16 @@ export function Layout() {
                 className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/vendas")}`}
               >
                 Vendas
+              </Link>
+            </li>
+
+            {/* NOVO: Custos & Lucro */}
+            <li>
+              <Link
+                to="/custos"
+                className={`block rounded px-3 py-2 text-sm ${isActiveStartsWith("/custos")}`}
+              >
+                Custos & Lucro
               </Link>
             </li>
 
@@ -226,6 +246,17 @@ export function Layout() {
                       Clientes
                     </Link>
                   </li>
+
+                  {/* 🆕 Histórico de Contas (mobile) */}
+                  <li>
+                    <Link
+                      to="/historico-contas"
+                      className={`block px-4 py-3 text-base ${isActiveStartsWith("/historico-contas")}`}
+                    >
+                      Histórico de Contas
+                    </Link>
+                  </li>
+
                   <li>
                     <Link
                       to="/precificacao"
@@ -240,6 +271,15 @@ export function Layout() {
                       className={`block px-4 py-3 text-base ${isActiveStartsWith("/vendas")}`}
                     >
                       Vendas
+                    </Link>
+                  </li>
+                  {/* NOVO: Custos & Lucro (mobile) */}
+                  <li>
+                    <Link
+                      to="/custos"
+                      className={`block px-4 py-3 text-base ${isActiveStartsWith("/custos")}`}
+                    >
+                      Custos & Lucro
                     </Link>
                   </li>
                   <li>

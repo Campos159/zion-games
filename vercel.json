@@ -1,8 +1,9 @@
 {
+  "builds": [
+    { "src": "package.json", "use": "@vercel/static-build", "config": { "distDir": "dist" } }
+  ],
   "rewrites": [
-    {
-      "source": "/api/:path*",
-      "destination": "https://zion-games.onrender.com/:path*"
-    }
+    { "source": "/api/:path*", "destination": "https://zion-games.onrender.com/:path*" },
+    { "source": "/:path*", "destination": "/index.html" }
   ]
 }

@@ -1,6 +1,11 @@
 // src/pages/JogosPage.tsx
+import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
+import { listarPedidos, listarItens, type PedidoRead, type ItemRead } from "../services/pedidos";
+import { montarHistoricoDessaConta } from "../utils/historicoConta";
+
+
 
 /* ============================================================
    Tipos e constantes
@@ -13,10 +18,25 @@ export type ContaJogo = {
   email: string;
   nick: string;
   senha: string;
+
+  /** Lista de códigos (1 por linha no UI) */
   ativacoes: string[];
-  ativacao?: string; // legado
+
+  /** LEGADO */
+  ativacao?: string;
+
+  /** Identidade da conta (mantido internamente; não exibimos mais o seletor de mídia no UI) */
   midia: Midia;
   plataforma: PlataformaConta;
+
+  /** LEGADO: custo não é exibido e não é fonte de verdade (backend armazena). */
+  preco?: number;
+
+  /** NOVOS: contadores/estado de vendas por plataforma */
+  sold_p_ps4?: number;        // primária PS4 (0..2)
+  sold_p_ps5?: number;        // primária PS5 (0..2)
+  sold_s?: boolean;           // secundária vendida?
+  sold_s_plat?: "PS4" | "PS5" | null; // se secundária vendida, em qual plataforma
 };
 
 export type Jogo = {
@@ -34,11 +54,13 @@ export type Jogo = {
   sku_ps5?: string;
   sku_ps4s?: string;
   sku_ps5s?: string;
-  codes?: string[]; // legado
-  email?: string;   // legado formulário rápido
-  nick?: string;    // legado
-  senha?: string;   // legado
-  ativacao?: string;// legado
+
+  /** LEGADO de versões antigas */
+  codes?: string[];
+  email?: string;
+  nick?: string;
+  senha?: string;
+  ativacao?: string;
 };
 
 export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
@@ -46,8 +68,15 @@ export type PlataformaKey = "ps4" | "ps5" | "ps4s" | "ps5s";
 export const JOGOS_STORAGE_KEY = "zion.jogos";
 
 /* ============================================================
-   Helpers compartilhados
+   Helpers compartilhados (com guards p/ SSR)
    ============================================================ */
+function hasWindow() {
+  return typeof window !== "undefined";
+}
+function hasLocalStorage() {
+  return hasWindow() && typeof window.localStorage !== "undefined";
+}
+
 export function normalizeSku(s: string | undefined | null): string {
   return (s ?? "").toString().trim().replace(/\s+/g, "");
 }
@@ -128,6 +157,7 @@ function derivarNomeJogo(mapped: Record<string, any>): string {
 }
 
 export function getJogosFromStorage(): Jogo[] {
+  if (!hasLocalStorage()) return [];
   try {
     const raw = localStorage.getItem(JOGOS_STORAGE_KEY);
     if (!raw) return [];
@@ -164,6 +194,11 @@ export function getJogosFromStorage(): Jogo[] {
             plataforma: (c.plataforma === "PS4" || c.plataforma === "PS5" || c.plataforma === "PS4s" || c.plataforma === "PS5s")
               ? (c.plataforma as PlataformaConta)
               : "PS5",
+            preco: Number(c.preco || 0) || 0, // legado (ignorado para custo)
+            sold_p_ps4: Number(c.sold_p_ps4 || 0) || 0,
+            sold_p_ps5: Number(c.sold_p_ps5 || 0) || 0,
+            sold_s: !!c.sold_s,
+            sold_s_plat: c.sold_s_plat === "PS4" || c.sold_s_plat === "PS5" ? (c.sold_s_plat as "PS4" | "PS5") : null,
           } as ContaJogo;
         });
       } else {
@@ -185,6 +220,11 @@ export function getJogosFromStorage(): Jogo[] {
                 ? "PRIMARIA"
                 : "SECUNDARIA",
             plataforma: "PS5",
+            preco: 0,
+            sold_p_ps4: 0,
+            sold_p_ps5: 0,
+            sold_s: false,
+            sold_s_plat: null,
           } as ContaJogo];
         }
       }
@@ -203,6 +243,7 @@ export function getJogosFromStorage(): Jogo[] {
 }
 
 export function setJogosToStorage(lista: Jogo[]) {
+  if (!hasLocalStorage()) return;
   localStorage.setItem(JOGOS_STORAGE_KEY, JSON.stringify(lista));
   try { window.dispatchEvent(new CustomEvent("zion:jogos-updated")); } catch {}
   try { window.dispatchEvent(new Event("zion.jogos:refresh")); } catch {}
@@ -287,6 +328,46 @@ function contasValidas(j: Jogo): number {
   ).length;
 }
 
+type EstoqueAtual = {
+  ps4: number;
+  ps5: number;
+  ps4s: number;
+  ps5s: number;
+};
+
+/**
+ * Calcula o estoque ATUAL por jogo, considerando:
+ * - cada conta tem 2 slots de primária PS4 e 2 de primária PS5;
+ * - secundária PS4/PS5 só libera após 2 primárias nessa plataforma;
+ * - secundária é 1 slot por conta;
+ * - só conta contas que ainda têm códigos (ativacoes.length > 0).
+ */
+function getEstoqueAtual(j: Jogo): EstoqueAtual {
+  const contas = j.contas || [];
+  let ps4 = 0;
+  let ps5 = 0;
+  let ps4s = 0;
+  let ps5s = 0;
+
+  for (const c of contas) {
+    const st = _slotsState(c);
+    const hasCodes = (c.ativacoes?.length || 0) > 0;
+
+    if (!hasCodes) continue;
+
+    // Primárias: cada conta tem até 2 slots por console
+    ps4 += Math.max(0, 2 - st.p4);
+    ps5 += Math.max(0, 2 - st.p5);
+
+    // Secundárias: 1 slot quando liberada e ainda não vendida
+    if (st.canSecPS4) ps4s += 1;
+    if (st.canSecPS5) ps5s += 1;
+  }
+
+  return { ps4, ps5, ps4s, ps5s };
+}
+
+
 /* ============================================================
    Importação Excel (flexível)
    ============================================================ */
@@ -348,6 +429,10 @@ const HEADER_MAP: Record<string, string> = {
 
   cod: "cod",
   codigo: "cod",
+
+  // NOVO: custo da conta vindo de planilha (vamos ignorar como fonte e futuramente enviar ao backend)
+  preco_conta: "preco_conta",
+  custo_conta: "preco_conta",
 };
 
 function normalizeDateCell(v: any): string {
@@ -405,7 +490,10 @@ function excelRowToJogo(row: ExcelRow): Partial<Jogo> & { contas?: ContaJogo[] }
   const nick = String(mapped.nick || "").trim();
   const senha = String(mapped.senha || "").trim();
   const ativacoes = splitCodes(mapped.ativacoes);
+  // custo_conta/preco_conta será enviado a tela própria de custos no futuro
+  const _precoContaLegacy = toNumber(mapped.preco_conta);
 
+  // Mantemos midia internamente, mas não exibimos no UI
   let midia: Midia = "PRIMARIA";
   const m = String(mapped.midia || "").trim().toUpperCase();
   if (m === "SECUNDARIA") midia = "SECUNDARIA";
@@ -417,8 +505,19 @@ function excelRowToJogo(row: ExcelRow): Partial<Jogo> & { contas?: ContaJogo[] }
   }
 
   const contas: ContaJogo[] =
-    email || nick || senha || (ativacoes?.length ?? 0) > 0
-      ? [{ id: uid(), email, nick, senha, ativacoes, midia, plataforma }]
+    email || nick || senha || (ativacoes?.length ?? 0) > 0 || _precoContaLegacy
+      ? [{
+          id: uid(),
+          email, nick, senha,
+          ativacoes,
+          midia, plataforma,
+          // `preco` legado não é exibido nem usado como custo real
+          preco: _precoContaLegacy || 0,
+          sold_p_ps4: 0,
+          sold_p_ps5: 0,
+          sold_s: false,
+          sold_s_plat: null,
+        }]
       : [];
 
   return {
@@ -477,7 +576,14 @@ function upsertJogo(
       sku_ps5: normalizeSku((incoming as any).sku_ps5),
       sku_ps4s: normalizeSku((incoming as any).sku_ps4s),
       sku_ps5s: normalizeSku((incoming as any).sku_ps5s),
-      contas: incoming.contas || [],
+      contas: (incoming.contas || []).map(c => ({
+        ...c,
+        preco: Number(c.preco || 0) || 0, // legado
+        sold_p_ps4: Number(c.sold_p_ps4 || 0) || 0,
+        sold_p_ps5: Number(c.sold_p_ps5 || 0) || 0,
+        sold_s: !!c.sold_s,
+        sold_s_plat: c.sold_s_plat === "PS4" || c.sold_s_plat === "PS5" ? c.sold_s_plat : null,
+      })),
     };
     return { lista: [...base, novo], created: true, updated: false };
   }
@@ -486,7 +592,14 @@ function upsertJogo(
   const soma = (a?: number, b?: number) => (Number(a || 0) + Number(b || 0));
   const contasMerged =
     (incoming.contas && incoming.contas.length)
-      ? [...(atual.contas || []), ...incoming.contas]
+      ? [...(atual.contas || []), ...incoming.contas.map(c => ({
+          ...c,
+          preco: Number(c.preco || 0) || 0, // legado
+          sold_p_ps4: Number(c.sold_p_ps4 || 0) || 0,
+          sold_p_ps5: Number(c.sold_p_ps5 || 0) || 0,
+          sold_s: !!c.sold_s,
+          sold_s_plat: c.sold_s_plat === "PS4" || c.sold_s_plat === "PS5" ? c.sold_s_plat : null,
+        })) ]
       : (atual.contas || []);
 
   const atualizado: Jogo = {
@@ -514,11 +627,60 @@ function upsertJogo(
 }
 
 /* ============================================================
+   Helpers de inferência e SKU por plataforma (para histórico por conta)
+   ============================================================ */
+function inferConsoleMidiaBySku(
+  j: Jogo,
+  sku: string
+): { console: "PS4" | "PS5"; midia: "PRIMARIA" | "SECUNDARIA" } | null {
+  const s = normalizeSku(sku);
+  if (!s) return null;
+
+  if (normalizeSku(j.sku_ps4) === s)   return { console: "PS4", midia: "PRIMARIA" };
+  if (normalizeSku(j.sku_ps5) === s)   return { console: "PS5", midia: "PRIMARIA" };
+  if (normalizeSku(j.sku_ps4s) === s)  return { console: "PS4", midia: "SECUNDARIA" };
+  if (normalizeSku(j.sku_ps5s) === s)  return { console: "PS5", midia: "SECUNDARIA" };
+  return null;
+}
+
+function getSkuByPlataforma(j: Jogo, plataforma: PlataformaConta): string | undefined {
+  if (plataforma === "PS4")  return normalizeSku(j.sku_ps4);
+  if (plataforma === "PS5")  return normalizeSku(j.sku_ps5);
+  if (plataforma === "PS4s") return normalizeSku(j.sku_ps4s);
+  if (plataforma === "PS5s") return normalizeSku(j.sku_ps5s);
+  return undefined;
+}
+
+/* ============================================================
    Componente
    ============================================================ */
-export function JogosPage() {
+export default function JogosPage() {
   const [lista, setLista] = useState<Jogo[]>(() => getJogosFromStorage());
   const [busca, setBusca] = useState("");
+
+  // FIX: persistir tudo que muda em lista
+  useEffect(() => {
+    setJogosToStorage(lista);
+  }, [lista]);
+
+  // Mantém a lista sincronizada com alterações feitas em outras telas / abas
+useEffect(() => {
+  if (!hasWindow()) return;
+
+  const handler = () => {
+    // recarrega do localStorage
+    setLista(getJogosFromStorage());
+  };
+
+  window.addEventListener("zion:jogos-updated", handler);
+  window.addEventListener("zion.jogos:refresh", handler);
+
+  return () => {
+    window.removeEventListener("zion:jogos-updated", handler);
+    window.removeEventListener("zion.jogos:refresh", handler);
+  };
+}, []);
+
 
   const listaRef = useRef<Jogo[]>(lista);
   useEffect(() => { listaRef.current = lista; }, [lista]);
@@ -554,8 +716,13 @@ export function JogosPage() {
     nick: "",
     senha: "",
     ativacoes: [],
-    midia: "PRIMARIA",
+    midia: "PRIMARIA",       // mantido interno (não exibimos no UI)
     plataforma: "PS5",
+    preco: 0,
+    sold_p_ps4: 0,
+    sold_p_ps5: 0,
+    sold_s: false,
+    sold_s_plat: null,
   });
   const [novaContaAtivacoesText, setNovaContaAtivacoesText] = useState<string>("");
 
@@ -563,43 +730,242 @@ export function JogosPage() {
   const [editConta, setEditConta] = useState<ContaJogo | null>(null);
   const [editContaAtivText, setEditContaAtivText] = useState<string>("");
 
-  useEffect(() => {
-    setJogosToStorage(lista);
-  }, [lista]);
+  // ===== Helpers de plataforma/mídia (iguais ao ClientesPage, com acento) =====
+  function stripAccents(s: string) {
+    return (s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
 
-  useEffect(() => {
-    const onRefresh = () => {
-      const incoming = getJogosFromStorage();
-      const same = JSON.stringify(incoming) === JSON.stringify(listaRef.current);
-      if (!same) setLista(incoming);
-    };
-    window.addEventListener("zion:jogos-updated", onRefresh);
-    window.addEventListener("zion.jogos:refresh", onRefresh);
-    return () => {
-      window.removeEventListener("zion:jogos-updated", onRefresh);
-      window.removeEventListener("zion.jogos:refresh", onRefresh);
-    };
-  }, []);
+  function plataformaKeyFromItemPlataforma(v?: string | null): PlataformaKey | null {
+    const raw = stripAccents(String(v || "").trim()).toLowerCase();
+    if (!raw) return null;
 
-  const filtrada = useMemo(() => {
-    const q = busca.trim().toLowerCase();
-    const base = recomputarCod(lista);
-    if (!q) return base;
-    return base.filter((j) => {
-      const camposBase = [
-        j.jogo,
-        j.sku_ps4, j.sku_ps5, j.sku_ps4s, j.sku_ps5s,
-      ].filter(Boolean).map(String);
+    // aceita: "PS4", "PS4 Primaria", "PS4 Secundaria", etc.
+    const isPS4 = raw.includes("ps4");
+    const isPS5 = raw.includes("ps5");
+    const isSec = raw.includes("sec"); // “sec”, “secundaria”
 
-      const camposContas = (j.contas || []).flatMap(c => [
-        c.email, c.nick, c.senha, ...(c.ativacoes || []), c.midia, c.plataforma
-      ]).filter(Boolean).map(String);
+    if (isPS4 && isSec) return "ps4s";
+    if (isPS5 && isSec) return "ps5s";
+    if (isPS4) return "ps4";
+    if (isPS5) return "ps5";
+    return null;
+  }
+  function midiaFromPlataformaKey(pk: PlataformaKey | null): Midia | null {
+    if (!pk) return null;
+    return pk === "ps4s" || pk === "ps5s" ? "SECUNDARIA" : "PRIMARIA";
+  }
+  function plataformaContaFromKey(pk: PlataformaKey): PlataformaConta {
+    if (pk === "ps4") return "PS4";
+    if (pk === "ps5") return "PS5";
+    if (pk === "ps4s") return "PS4s";
+    return "PS5s";
+  }
 
-      const camposCodesJogo = (j.codes || []);
-      const todos = [...camposBase, ...camposContas, ...camposCodesJogo].join("|").toLowerCase();
-      return todos.includes(q);
+  // ======= NOVO: Histórico por CONTA =======
+  type HistItem = {
+    pedidoId: number | string;
+    quando: string;
+    cliente: string;
+    telefone?: string | null;
+    sku?: string | null;
+    console?: "PS4" | "PS5";
+    midia?: Midia;
+  };
+
+  const [histOpen, setHistOpen] = useState(false);
+  const [histLoading, setHistLoading] = useState(false);
+  const [histErr, setHistErr] = useState<string | null>(null);
+  const [histConta, setHistConta] = useState<ContaJogo | null>(null);
+  const [histJogo, setHistJogo] = useState<Jogo | null>(null);
+  const [histSku, setHistSku] = useState<string | null>(null);
+  const [histRows, setHistRows] = useState<HistItem[]>([]);
+
+  function fecharHistoricoConta() {
+    setHistOpen(false);
+    setHistLoading(false);
+    setHistErr(null);
+    setHistConta(null);
+    setHistJogo(null);
+    setHistSku(null);
+    setHistRows([]);
+  }
+
+ // NOVO HELPER: filtrar linhas pelo id ou email da conta, mas sem "matar" linhas sem identificador
+    // NOVO HELPER: filtrar linhas pelo id ou email da conta
+  function filtrarLinhasPorConta(linhas: any[], conta: ContaJogo): any[] {
+    if (!conta) return linhas;
+
+    const emailConta = (conta.email || "").trim().toLowerCase();
+    const contaId = conta.id;
+
+    return linhas.filter((linha) => {
+      const linhaContaId = String(
+        (linha?.contaId ?? linha?.conta_id ?? "") || ""
+      );
+
+      const emailLinhaRaw =
+        linha?.contaEmail ??
+        linha?.emailConta ??
+        linha?.email_conta ??
+        null;
+
+      const emailLinha = (emailLinhaRaw || "").trim().toLowerCase();
+
+      // 1) Se veio contaId na linha, usamos ele como filtro forte
+      if (linhaContaId) {
+        return linhaContaId === contaId;
+      }
+
+      // 2) Se não tem contaId, mas tem email, filtramos por email
+      if (emailLinha && emailConta) {
+        return emailLinha === emailConta;
+      }
+
+      // 3) Se não temos NENHUM identificador, não filtramos essa linha
+      return true;
     });
-  }, [lista, busca]);
+  }
+
+
+
+   // FIX: histórico por CONTA usando o util centralizado + telefone do pedido
+    // Histórico por CONTA usando o util centralizado + telefone do pedido
+  async function abrirHistoricoConta(j: Jogo, c: ContaJogo) {
+    const skuDaConta = getSkuByPlataforma(j, c.plataforma) || "";
+
+    setHistOpen(true);
+    setHistLoading(true);
+    setHistErr(null);
+    setHistConta(c);
+    setHistJogo(j);
+    setHistSku(skuDaConta || null);
+    setHistRows([]);
+
+    try {
+      // 1) Deixa o util decidir o que pertence a ESSA conta (id/email/nick/senha/mídia/plataforma)
+      const linhasRaw = await montarHistoricoDessaConta({
+        id: c.id,
+        email: c.email,
+        nick: c.nick,
+        senha: c.senha,
+        midia: c.midia,
+        plataforma: c.plataforma,
+      });
+
+      // 2) Carrega pedidos para enriquecer com telefone (se existir no payload do backend)
+      const pedidos: PedidoRead[] = await listarPedidos({} as any);
+      const telById = new Map<number, string | null>();
+      for (const p of pedidos) {
+        const anyP: any = p;
+        const tel =
+          anyP.telefone ??
+          anyP.cliente_telefone ??
+          anyP.fone ??
+          null;
+        telById.set(p.id, tel ? String(tel) : null);
+      }
+
+      // 3) Converte para o formato da UI atual (HistItem)
+      const rows: HistItem[] = (linhasRaw as any[]).map((l: any) => {
+        const pedidoId: number | string =
+          l.pedidoId ??
+          l.pedido_id ??
+          l.item?.pedido_id ??
+          "—";
+
+        const quando: string =
+          l.dataPedido ??
+          l.data_pedido ??
+          l.quando ??
+          l.enviado_em ??
+          "";
+
+        const cliente: string =
+          l.clienteNome ??
+          l.cliente_nome ??
+          l.cliente ??
+          "(sem nome)";
+
+        const telefone =
+          l.clienteTelefone ??
+          l.telefone ??
+          telById.get(l.pedidoId) ??
+          null;
+
+        const plataformaItem: string =
+          l.plataformaItem ??
+          l.plataforma ??
+          l.item?.plataforma ??
+          "";
+
+        const platUpper = String(plataformaItem).toUpperCase();
+        const console: "PS4" | "PS5" | undefined =
+          platUpper.includes("PS4")
+            ? "PS4"
+            : platUpper.includes("PS5")
+            ? "PS5"
+            : undefined;
+
+        const midia: Midia =
+          (l.midiaItem as Midia | null) ??
+          (l.midia as Midia | null) ??
+          c.midia;
+
+        const sku: string | null =
+          l.sku ??
+          l.item?.sku ??
+          l.item?.sku_ps4 ??
+          l.item?.sku_ps5 ??
+          null;
+
+        return {
+          pedidoId,
+          quando: quando || "",
+          cliente,
+          telefone,
+          sku,
+          console,
+          midia,
+        };
+      });
+
+      // 4) Ordena (mais recente primeiro)
+      rows.sort(
+        (a, b) =>
+          (a.quando > b.quando ? -1 : a.quando < b.quando ? 1 : 0) ||
+          (String(a.pedidoId) > String(b.pedidoId) ? -1 : 1)
+      );
+
+      setHistRows(rows);
+    } catch (e: any) {
+      console.error("[JogosPage] erro em abrirHistoricoConta:", e);
+      setHistErr(String(e?.message || e));
+    } finally {
+      setHistLoading(false);
+    }
+  }
+
+
+
+  function copiarParaClipboard(txt: string) {
+    try {
+      if (hasWindow() && navigator?.clipboard?.writeText) {
+        navigator.clipboard.writeText(txt);
+        alert("Telefone copiado!");
+      } else {
+        throw new Error("Clipboard API indisponível");
+      }
+    } catch {
+      if (!hasWindow()) return;
+      const ta = document.createElement("textarea");
+      ta.value = txt;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+      alert("Telefone copiado!");
+    }
+  }
 
   /* ----------------- CRUD JOGO ----------------- */
   function limparForm() {
@@ -635,8 +1001,13 @@ export function JogosPage() {
         nick: String(form.nick || ""),
         senha: String(form.senha || ""),
         ativacoes: splitCodes(form.ativacao),
-        midia: "PRIMARIA",
+        midia: "PRIMARIA", // mantido interno
         plataforma: "PS5",
+        preco: 0,
+        sold_p_ps4: 0,
+        sold_p_ps5: 0,
+        sold_s: false,
+        sold_s_plat: null,
       });
     }
 
@@ -758,7 +1129,7 @@ export function JogosPage() {
     const normalizados = headersRaw.map(normalizeHeader);
     const mapeados = normalizados.map((h) => HEADER_MAP[h] || h);
 
-    const camposUteis = ["jogo","jogos","ps4","ps5","ps4s","ps5s","valor","data","email","senha","nick","ativacoes","sku_ps4","sku_ps5","sku_ps4s","sku_ps5s"];
+    const camposUteis = ["jogo","jogos","ps4","ps5","ps4s","ps5s","valor","data","email","senha","nick","ativacoes","sku_ps4","sku_ps5","sku_ps4s","sku_ps5s","preco_conta"];
     const temAlgumUtil = camposUteis.some((c) => mapeados.includes(c) || normalizados.includes(c));
 
     const avisoSemNome = !mapeados.includes("jogo") &&
@@ -791,7 +1162,7 @@ export function JogosPage() {
       const ver = validarCabecalhos(headersRaw);
       if (!ver.ok) {
         alert(
-          "Importação cancelada: não encontrei colunas úteis (ex.: Jogos/Jogo, PS4/PS5/PS4s/PS5s, Valor, Data, Email/Senha, ou SKUs).\n" +
+          "Importação cancelada: não encontrei colunas úteis (ex.: Jogos/Jogo, PS4/PS5/PS4s/PS5s, Valor, Data, Email/Senha, SKUs ou Preço da Conta).\n" +
           "Ajuste a planilha e tente novamente."
         );
         console.warn("[Importação] Colunas detectadas:", headersRaw);
@@ -841,7 +1212,7 @@ export function JogosPage() {
           base = merged;
           if (c) created += 1;
           if (u) updated += 1;
-        } catch (err) {
+        } catch {
           errors += 1;
         }
       }
@@ -869,7 +1240,7 @@ export function JogosPage() {
           `Nada a importar de "${file.name}".\n` +
           `Vazias/ignoradas: ${ignored}\n` +
           `Erros: ${errors}\n` +
-          `Dica: preencha ao menos Quantidades, Valor, Dados de Conta ou SKUs.`
+          `Dica: preencha ao menos Quantidades, Valor, Dados de Conta, SKUs ou Preço da Conta.`
         );
       } else {
         const extra =
@@ -900,8 +1271,13 @@ export function JogosPage() {
       nick: "",
       senha: "",
       ativacoes: [],
-      midia: "PRIMARIA",
+      midia: "PRIMARIA", // mantido interno
       plataforma: "PS5",
+      preco: 0,
+      sold_p_ps4: 0,
+      sold_p_ps5: 0,
+      sold_s: false,
+      sold_s_plat: null,
     });
     setNovaContaAtivacoesText("");
     setEditContaId(null);
@@ -918,17 +1294,39 @@ export function JogosPage() {
   function adicionarConta() {
     if (!jogoModal) return;
     const ativs = splitCodes(novaContaAtivacoesText);
-    if (!novaConta.email.trim() && !novaConta.nick.trim() && !novaConta.senha.trim() && ativs.length === 0) {
-      alert("Preencha ao menos um campo da conta ou inclua códigos.");
+    if (!novaConta.email.trim() && !novaConta.nick.trim() && !novaConta.senha.trim() && ativs.length === 0 && !novaConta.preco) {
+      alert("Preencha ao menos um campo da conta (ou preço/códigos).");
       return;
     }
-    const nova: ContaJogo = { ...novaConta, id: uid(), ativacoes: ativs };
+    const nova: ContaJogo = {
+      ...novaConta,
+      id: uid(),
+      ativacoes: ativs,
+      preco: Number(novaConta.preco || 0) || 0,
+      sold_p_ps4: Number(novaConta.sold_p_ps4 || 0) || 0,
+      sold_p_ps5: Number(novaConta.sold_p_ps5 || 0) || 0,
+      sold_s: !!novaConta.sold_s,
+      sold_s_plat: novaConta.sold_s_plat === "PS4" || novaConta.sold_s_plat === "PS5" ? novaConta.sold_s_plat : null,
+    };
     const atualizada = lista.map(j => j.id === jogoModal.id
       ? { ...j, contas: [ ...(j.contas || []), nova ] }
       : j
     );
     setLista(recomputarCod(atualizada));
-    setNovaConta({ id: "", email: "", nick: "", senha: "", ativacoes: [], midia: "PRIMARIA", plataforma: "PS5" });
+    setNovaConta({
+      id: "",
+      email: "",
+      nick: "",
+      senha: "",
+      ativacoes: [],
+      midia: "PRIMARIA",
+      plataforma: "PS5",
+      preco: 0,
+      sold_p_ps4: 0,
+      sold_p_ps5: 0,
+      sold_s: false,
+      sold_s_plat: null,
+    });
     setNovaContaAtivacoesText("");
   }
 
@@ -950,7 +1348,18 @@ export function JogosPage() {
       return {
         ...j,
         contas: (j.contas || []).map(c =>
-          c.id === editContaId ? { ...editConta, id: editContaId, ativacoes: ativs } : c
+          c.id === editContaId
+            ? {
+                ...editConta,
+                id: editContaId,
+                ativacoes: ativs,
+                preco: Number(editConta.preco || 0) || 0,
+                sold_p_ps4: Number(editConta.sold_p_ps4 || 0) || 0,
+                sold_p_ps5: Number(editConta.sold_p_ps5 || 0) || 0,
+                sold_s: !!editConta.sold_s,
+                sold_s_plat: editConta.sold_s_plat === "PS4" || editConta.sold_s_plat === "PS5" ? editConta.sold_s_plat : null,
+              }
+            : c
         ),
       };
     });
@@ -968,6 +1377,29 @@ export function JogosPage() {
     );
     setLista(recomputarCod(atualizada));
   }
+
+  /* ----------------- LISTA FILTRADA ----------------- */
+  const filtrada: Jogo[] = useMemo(() => {
+    const q = busca.trim().toLowerCase();
+    const base = recomputarCod(lista);
+    if (!q) return base;
+
+    return base.filter((j: Jogo) => {
+      const camposBase = [
+        j.jogo,
+        j.sku_ps4, j.sku_ps5, j.sku_ps4s, j.sku_ps5s,
+      ].filter(Boolean).map(String);
+
+      const camposContas = (j.contas || []).flatMap((c: ContaJogo) => [
+        c.email, c.nick, c.senha, ...(c.ativacoes || []), c.plataforma, c.preco ?? 0,
+        c.sold_p_ps4 ?? 0, c.sold_p_ps5 ?? 0, c.sold_s ? "sec-vendida" : "sec-livre", c.sold_s_plat ?? "",
+      ]).filter(Boolean).map(String);
+
+      const camposCodesJogo = (j as any).codes || [];
+      const todos = [...camposBase, ...camposContas, ...camposCodesJogo].join("|").toLowerCase();
+      return todos.includes(q);
+    });
+  }, [lista, busca]);
 
   /* ----------------- RENDER ----------------- */
   return (
@@ -1016,7 +1448,7 @@ export function JogosPage() {
         <input
           value={busca}
           onChange={(e) => setBusca(e.target.value)}
-          placeholder="Buscar por jogo, SKU, credenciais ou códigos..."
+          placeholder="Buscar por jogo, SKU, credenciais, códigos ou preço da conta…"
           className="flex-1 border rounded-lg px-3 py-2 outline-none focus:ring-2 focus:ring-brand-100"
         />
         <div className="text-sm text-slate-500">{filtrada.length} registro(s)</div>
@@ -1131,18 +1563,18 @@ export function JogosPage() {
               type="text"
             />
           </div>
-          <div>
-            <label className="text-sm block mb-1">Ativações iniciais (1 por linha) — opcional</label>
-            <input
-              value={form.ativacao || ""}
-              onChange={(e) => setForm((f) => ({ ...f, ativacao: e.target.value }))}
-              className="w-full border rounded-lg px-3 py-2"
-              placeholder="ABC-123-XYZ\nDEF-456-UVW"
-            />
-          </div>
-          <div className="self-end text-xs text-slate-500">
-            Se preencher, cria a 1ª conta (PRIMÁRIA) com esses códigos.
-          </div>
+            <div>
+              <label className="text-sm block mb-1">Ativações iniciais (1 por linha) — opcional</label>
+              <input
+                value={form.ativacao || ""}
+                onChange={(e) => setForm((f) => ({ ...f, ativacao: e.target.value }))}
+                className="w-full border rounded-lg px-3 py-2"
+                placeholder="ABC-123-XYZ\nDEF-456-UVW"
+              />
+            </div>
+            <div className="self-end text-xs text-slate-500">
+              Se preencher, cria a 1ª conta com esses códigos.
+            </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -1205,12 +1637,14 @@ export function JogosPage() {
             Nenhum registro.
           </div>
         ) : (
-          filtrada.map((j) => {
+          filtrada.map((j: Jogo) => {
             const emEdicao = editingId === j.id;
             const contas = j.contas || [];
             const totalContasValid = contasValidas(j);
-            const totalCodes = contas.reduce((acc, c) => acc + (c.ativacoes?.length || 0), 0);
+            const totalCodes = contas.reduce((acc: number, c: ContaJogo) => acc + (c.ativacoes?.length || 0), 0);
             const preview = contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0];
+            
+            const estoque = getEstoqueAtual(j);
 
             return (
               <div key={j.id} className="bg-white rounded-xl border border-slate-200 p-3">
@@ -1265,30 +1699,31 @@ export function JogosPage() {
                   </div>
 
                   <div>
-                    <div className="text-slate-500">Quantidades</div>
-                    {!emEdicao ? (
-                      <div className="font-medium text-xs">
-                        PS4 {j.ps4} • PS5 {j.ps5} • PS4s {j.ps4s} • PS5s {j.ps5s}
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-4 gap-1">
-                        {(["ps4","ps5","ps4s","ps5s"] as const).map(k => (
-                          <input
-                            key={k}
-                            type="number" min={0}
-                            value={(editRow as any)?.[k] ?? 0}
-                            onChange={(e) =>
-                              setEditRow((r) =>
-                                r ? ({ ...r, [k]: Number(e.target.value) } as any) : r
-                              )
-                            }
-                            className="border rounded px-2 py-1"
-                            placeholder={k.toUpperCase()}
-                          />
-                        ))}
-                      </div>
-                    )}
-                  </div>
+  <div className="text-slate-500">Estoque atual</div>
+  {!emEdicao ? (
+    <div className="font-medium text-xs">
+      PS4 {estoque.ps4} • PS5 {estoque.ps5} • PS4s {estoque.ps4s} • PS5s {estoque.ps5s}
+    </div>
+  ) : (
+    <div className="grid grid-cols-4 gap-1">
+      {(["ps4","ps5","ps4s","ps5s"] as const).map(k => (
+        <input
+          key={k}
+          type="number" min={0}
+          value={(editRow as any)?.[k] ?? 0}
+          onChange={(e) =>
+            setEditRow((r) =>
+              r ? ({ ...r, [k]: Number(e.target.value) } as any) : r
+            )
+          }
+          className="border rounded px-2 py-1"
+          placeholder={k.toUpperCase()}
+        />
+      ))}
+    </div>
+  )}
+</div>
+
 
                   <div className="col-span-2">
                     <div className="text-slate-500">SKUs</div>
@@ -1364,12 +1799,14 @@ export function JogosPage() {
             </tr>
           </thead>
           <tbody>
-            {filtrada.map((j) => {
+            {filtrada.map((j: Jogo) => {
               const emEdicao = editingId === j.id;
               const contas = j.contas || [];
               const totalContasValid = contasValidas(j);
-              const totalCodes = contas.reduce((acc, c) => acc + (c.ativacoes?.length || 0), 0);
+              const totalCodes = contas.reduce((acc: number, c: ContaJogo) => acc + (c.ativacoes?.length || 0), 0);
               const preview = contas.find(c => (c.ativacoes || []).length > 0)?.ativacoes?.[0] ?? undefined;
+
+              const estoque = getEstoqueAtual(j);
 
               return (
                 <tr key={j.id} className="border-t">
@@ -1406,22 +1843,26 @@ export function JogosPage() {
                     )}
                   </td>
 
-                  {(["ps4","ps5","ps4s","ps5s"] as const).map((k) => (
-                    <td key={k} className="px-3 py-2 text-center">
-                      {emEdicao ? (
-                        <input
-                          type="number" min={0}
-                          value={(editRow as any)?.[k] ?? 0}
-                          onChange={(e) =>
-                            setEditRow((r) =>
-                              r ? ({ ...r, [k]: Number(e.target.value) } as any) : r
-                            )
-                          }
-                          className="border rounded px-2 py-1 w-16 text-center"
-                        />
-                      ) : ((j as any)[k] || 0)}
-                    </td>
-                  ))}
+                 {(["ps4","ps5","ps4s","ps5s"] as const).map((k) => (
+  <td key={k} className="px-3 py-2 text-center">
+    {emEdicao ? (
+      <input
+        type="number" min={0}
+        value={(editRow as any)?.[k] ?? 0}
+        onChange={(e) =>
+          setEditRow((r) =>
+            r ? ({ ...r, [k]: Number(e.target.value) } as any) : r
+          )
+        }
+        className="border rounded px-2 py-1 w-16 text-center"
+      />
+    ) : (
+      // AQUI passa a usar o estoque dinâmico:
+      (estoque as any)[k] || 0
+    )}
+  </td>
+))}
+
 
                   <td className="px-3 py-2 align-top">
                     {!emEdicao ? (
@@ -1558,6 +1999,7 @@ export function JogosPage() {
                 </h3>
                 <p className="text-slate-600 text-sm">
                   Em cada conta, insira os códigos no campo <b>Ativações</b> (um por linha).
+                  Agora cada <b>Conta</b> também pode ter um <b>Preço</b> e mostra o <b>placar de vendas</b>.
                 </p>
               </div>
               <button onClick={fecharModal} className="self-start sm:self-auto rounded-lg border px-3 py-1.5 hover:bg-slate-50">
@@ -1573,8 +2015,9 @@ export function JogosPage() {
                     <th className="text-left px-3 py-2">Nick</th>
                     <th className="text-left px-3 py-2">Senha</th>
                     <th className="text-left px-3 py-2">Ativações</th>
-                    <th className="text-left px-3 py-2">Mídia</th>
-                    <th className="text-left px-3 py-2">Versão</th>
+                    <th className="text-right px-3 py-2">Preço</th>
+                    <th className="text-left px-3 py-2">Placar (P4/P5/S)</th>
+                    <th className="text-left px-3 py-2">Desbloqueio da Sec</th>
                     <th className="text-right px-3 py-2">Ações</th>
                   </tr>
                 </thead>
@@ -1583,6 +2026,16 @@ export function JogosPage() {
                     const emEdicao = editContaId === c.id;
                     const totalC = c.ativacoes?.length || 0;
                     const preview = c.ativacoes?.[0];
+
+                    const sold_p_ps4 = c.sold_p_ps4 ?? 0;
+                    const sold_p_ps5 = c.sold_p_ps5 ?? 0;
+
+                    const secUnlockedPS4 = sold_p_ps4 >= 2;
+                    const secUnlockedPS5 = sold_p_ps5 >= 2;
+                    const secStatus =
+                      c.sold_s
+                        ? `Vendida (${c.sold_s_plat || "—"})`
+                        : "—";
 
                     return (
                       <tr key={c.id} className="border-t align-top">
@@ -1634,49 +2087,52 @@ export function JogosPage() {
                           )}
                         </td>
 
-                        <td className="px-3 py-2">
+                        {/* coluna de MÍDIA removida (apenas UI) */}
+
+                        
+                        <td className="px-3 py-2 text-right">
                           {emEdicao ? (
-                            <select
-                              value={editConta?.midia ?? "PRIMARIA"}
-                              onChange={(e) => setEditConta((x) => (x ? { ...x, midia: e.target.value as Midia } : x))}
-                              className="border rounded px-2 py-1 bg-white"
-                            >
-                              <option value="PRIMARIA">PRIMÁRIA</option>
-                              <option value="SECUNDARIA">SECUNDÁRIA</option>
-                            </select>
+                            <input
+                              type="number" step="0.01" min="0"
+                              value={editConta?.preco ?? 0}
+                              onChange={(e) => setEditConta((x) => (x ? { ...x, preco: Number(e.target.value) } : x))}
+                              className="border rounded px-2 py-1 w-28 text-right"
+                              placeholder="0,00"
+                            />
                           ) : (
-                            <span
-                              className={`text-[10px] uppercase tracking-wide border rounded-full px-2 py-0.5 ${
-                                c.midia === "PRIMARIA"
-                                  ? "bg-blue-100 text-blue-800 border-blue-200"
-                                  : "bg-amber-100 text-amber-800 border-amber-200"
-                              }`}
-                            >
-                              {c.midia === "PRIMARIA" ? "Primária" : "Secundária"}
-                            </span>
+                            (c.preco ?? 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" })
                           )}
                         </td>
 
                         <td className="px-3 py-2">
-                          {emEdicao ? (
-                            <select
-                              value={editConta?.plataforma ?? "PS5"}
-                              onChange={(e) => setEditConta((x) => (x ? { ...x, plataforma: e.target.value as PlataformaConta } : x))}
-                              className="border rounded px-2 py-1 bg-white"
-                            >
-                              <option value="PS4">PS4</option>
-                              <option value="PS5">PS5</option>
-                              <option value="PS4s">PS4s (secundária)</option>
-                              <option value="PS5s">PS5s (secundária)</option>
-                            </select>
-                          ) : (
-                            <span className="text-xs">{c.plataforma}</span>
-                          )}
+                          <div className="text-xs text-slate-700">
+                            <div>P(PS4): <b>{sold_p_ps4}/2</b> • P(PS5): <b>{sold_p_ps5}/2</b></div>
+                            <div>S: <b>{c.sold_s ? secStatus : "—"}</b></div>
+                          </div>
+                        </td>
+
+                        {/* NOVO: indicadores de desbloqueio da Secundária */}
+                        <td className="px-3 py-2">
+                          <div className="text-xs">
+                            <div className={secUnlockedPS4 ? "text-emerald-700" : "text-slate-500"}>
+                              Sec PS4: {secUnlockedPS4 ? "Liberada" : "Bloqueada (precisa 2 Prim PS4)"}
+                            </div>
+                            <div className={secUnlockedPS5 ? "text-emerald-700" : "text-slate-500"}>
+                              Sec PS5: {secUnlockedPS5 ? "Liberada" : "Bloqueada (precisa 2 Prim PS5)"}
+                            </div>
+                          </div>
                         </td>
 
                         <td className="px-3 py-2 text-right">
                           {!emEdicao ? (
                             <div className="flex gap-3 justify-end">
+                              <button
+                                onClick={() => abrirHistoricoConta(jogoModal, c)}
+                                className="text-slate-700 hover:underline"
+                                title="Ver histórico de vendas desta conta (SKU correspondente à plataforma da conta)"
+                              >
+                                Histórico
+                              </button>
                               <button
                                 onClick={() => iniciarEdicaoConta(c)}
                                 className="text-brand-700 hover:underline"
@@ -1706,7 +2162,7 @@ export function JogosPage() {
                   })}
                   {(jogoModal.contas || []).length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-3 py-6 text-center text-slate-500">
+                      <td colSpan={8} className="px-3 py-6 text-center text-slate-500">
                         Nenhuma conta cadastrada para este jogo.
                       </td>
                     </tr>
@@ -1717,7 +2173,7 @@ export function JogosPage() {
 
             <div className="border-t pt-4">
               <h4 className="font-medium text-slate-900 mb-2">Adicionar conta</h4>
-              <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
                 <input
                   placeholder="E-mail"
                   value={novaConta.email}
@@ -1743,24 +2199,14 @@ export function JogosPage() {
                   onChange={(e) => setNovaContaAtivacoesText(e.target.value)}
                   className="border rounded-lg px-3 py-2 min-h-[40px]"
                 />
-                <select
-                  value={novaConta.midia}
-                  onChange={(e) => setNovaConta((c) => ({ ...c, midia: e.target.value as Midia }))}
-                  className="border rounded-lg px-3 py-2 bg-white"
-                >
-                  <option value="PRIMARIA">Primária</option>
-                  <option value="SECUNDARIA">Secundária</option>
-                </select>
-                <select
-                  value={novaConta.plataforma}
-                  onChange={(e) => setNovaConta((c) => ({ ...c, plataforma: e.target.value as PlataformaConta }))}
-                  className="border rounded-lg px-3 py-2 bg-white"
-                >
-                  <option value="PS4">PS4</option>
-                  <option value="PS5">PS5</option>
-                  <option value="PS4s">PS4s (secundária)</option>
-                  <option value="PS5s">PS5s (secundária)</option>
-                </select>
+
+                <input
+                  placeholder="Preço da conta (R$)"
+                  type="number" step="0.01" min="0"
+                  value={novaConta.preco ?? 0}
+                  onChange={(e) => setNovaConta((c) => ({ ...c, preco: Number(e.target.value) }))}
+                  className="border rounded-lg px-3 py-2"
+                />
               </div>
               <div className="mt-3">
                 <button
@@ -1775,6 +2221,265 @@ export function JogosPage() {
         </div>
       )}
       {/* --------- /MODAL --------- */}
+
+      {/* --------- MODAL: Histórico por Conta --------- */}
+      {histOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) fecharHistoricoConta();
+          }}
+        >
+          <div className="relative bg-white rounded-2xl shadow-xl border border-slate-200 p-4
+                          w-[calc(100vw-1.5rem)] sm:w-[95vw] max-w-5xl max-h-[85vh] overflow-auto">
+            <div className="flex items-start justify-between gap-4 mb-3">
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-slate-900 truncate">
+                  Histórico — {histJogo?.jogo || "(Jogo)"} • {histConta?.email || histConta?.nick || "Conta"}
+                </h3>
+                <p className="text-slate-600 text-sm">
+                  SKU: <b>{histSku || "—"}</b> • Plataforma da conta: <b>{histConta?.plataforma || "—"}</b>
+                </p>
+              </div>
+              <button onClick={fecharHistoricoConta} className="rounded-lg border px-3 py-1.5 hover:bg-slate-50">
+                Fechar
+              </button>
+            </div>
+
+            {histLoading && <div className="text-sm text-slate-600">Carregando histórico…</div>}
+            {histErr && <div className="text-sm text-rose-700">Erro ao carregar histórico: {histErr}</div>}
+
+            {!histLoading && !histErr && histRows.length === 0 && (
+              <div className="text-sm text-slate-500">
+                Nenhum envio encontrado para <b>esta conta</b>.
+              </div>
+            )}
+
+            {!histLoading && !histErr && histRows.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-slate-50 text-slate-700">
+                    <tr>
+                      <th className="text-left px-3 py-2">Quando</th>
+                      <th className="text-left px-3 py-2">Cliente</th>
+                      <th className="text-left px-3 py-2">Telefone</th>
+                      <th className="text-left px-3 py-2">Venda</th>
+                      <th className="text-right px-3 py-2">Ações</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {histRows.map((h) => {
+                      const isPrim = h.midia === "PRIMARIA";
+                      const chipClasses =
+                        "inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] " +
+                        (isPrim
+                          ? "bg-blue-100 border-blue-200 text-blue-800"
+                          : "bg-amber-100 border-amber-200 text-amber-800");
+
+                      return (
+                        <tr key={`${h.pedidoId}-${h.sku}-${h.quando}`} className="border-t">
+                          <td className="px-3 py-2">{h.quando || "—"}</td>
+                          <td className="px-3 py-2">{h.cliente}</td>
+                          <td className="px-3 py-2">{h.telefone || "—"}</td>
+<td className="px-3 py-2">
+  {h.console && h.midia ? (() => {
+    const isPrim = h.midia === "PRIMARIA";
+
+    // monta o rótulo PS4 / PS5 / PS4s / PS5s
+    let versaoLabel: string;
+    if (h.console === "PS4" && h.midia === "SECUNDARIA") versaoLabel = "PS4s";
+    else if (h.console === "PS5" && h.midia === "SECUNDARIA") versaoLabel = "PS5s";
+    else versaoLabel = h.console; // PS4 ou PS5 primária
+
+    const chipClasses =
+      "inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[11px] " +
+      (isPrim
+        ? "bg-blue-100 border-blue-200 text-blue-800"
+        : "bg-amber-100 border-amber-200 text-amber-800");
+
+    return (
+      <span className={chipClasses}>
+        <span className="font-semibold">{versaoLabel}</span>
+        <span>•</span>
+        <span>{isPrim ? "Primária" : "Secundária"}</span>
+      </span>
+    );
+  })() : "—"}
+</td>
+                          <td className="px-3 py-2 text-right">
+                            <button
+                              disabled={!h.telefone}
+                              onClick={() => h.telefone && copiarParaClipboard(h.telefone)}
+                              className={`px-2 py-1 rounded border ${h.telefone ? "hover:bg-slate-50" : "opacity-50 cursor-not-allowed"}`}
+                              title={h.telefone ? "Copiar telefone" : "Sem telefone"}
+                            >
+                              Copiar telefone
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+      {/* --------- /MODAL: Histórico por Conta --------- */}
     </div>
   );
+}
+
+/* ============================================================
+   Vendas automáticas por SKU (export p/ EnviosManuaisPage.tsx)
+   Regras (mantidas):
+   - Primária PS4: máx 2
+   - Primária PS5: máx 2
+   - Secundária PS4: só se já vendeu 2 primárias PS4 e ainda não vendeu S
+   - Secundária PS5: só se já vendeu 2 primárias PS5 e ainda não vendeu S
+   - Ao vender S, trava na plataforma (sold_s_plat) e bloqueia a outra.
+   ============================================================ */
+
+export type SaleKind = "P_PS4" | "P_PS5" | "S_PS4" | "S_PS5";
+
+function _clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function _slotsState(c: ContaJogo) {
+  const p4 = _clamp(Number(c.sold_p_ps4 ?? 0), 0, 2);
+  const p5 = _clamp(Number(c.sold_p_ps5 ?? 0), 0, 2);
+  const secSold = !!c.sold_s;
+  const secPlat = (c.sold_s_plat === "PS4" || c.sold_s_plat === "PS5") ? c.sold_s_plat : null;
+
+  const canPrimPS4 = p4 < 2;
+  const canPrimPS5 = p5 < 2;
+
+  const secUnlockedPS4 = p4 >= 2;
+  const secUnlockedPS5 = p5 >= 2;
+
+  const canSecPS4 = !secSold && secUnlockedPS4 && (!secPlat || secPlat === "PS4");
+  const canSecPS5 = !secSold && secUnlockedPS5 && (!secPlat || secPlat === "PS5");
+
+  return {
+    p4, p5, secSold, secPlat,
+    canPrimPS4, canPrimPS5,
+    secUnlockedPS4, secUnlockedPS5,
+    canSecPS4, canSecPS5,
+  };
+}
+
+/** Localiza {jogo, conta} a partir do SKU + mídia inferida pelo tipo de venda */
+function _findContaForKindBySku(skuRaw: string, kind: SaleKind): { jogo: Jogo; conta: ContaJogo } | null {
+  const midia: Midia = (kind === "P_PS4" || kind === "P_PS5") ? "PRIMARIA" : "SECUNDARIA";
+  const hit = findContaBySkuAndMidia(skuRaw, midia);
+  if (!hit) return null;
+  return { jogo: hit.jogo, conta: hit.conta };
+}
+
+/** Atualiza uma conta no localStorage (sem React state) */
+function _updateAccountPersist(jogoId: string, contaId: string, updater: (c: ContaJogo) => ContaJogo): { ok: boolean; jogo?: Jogo; conta?: ContaJogo } {
+  const lista = getJogosFromStorage();
+  const jIdx = lista.findIndex(j => j.id === jogoId);
+  if (jIdx < 0) return { ok: false };
+  const jogo = lista[jIdx];
+  const cIdx = (jogo.contas || []).findIndex(c => c.id === contaId);
+  if (cIdx < 0) return { ok: false };
+  const curr = (jogo.contas || [])[cIdx];
+
+  const next = updater(curr);
+  const novoJogo: Jogo = {
+    ...jogo,
+    contas: (jogo.contas || []).map((c, k) => (k === cIdx ? next : c)),
+  };
+  const novaLista = [
+    ...lista.slice(0, jIdx),
+    novoJogo,
+    ...lista.slice(jIdx + 1),
+  ];
+  setJogosToStorage(recomputarCod(novaLista));
+  return { ok: true, jogo: novoJogo, conta: next };
+}
+
+export function checkSaleEligibilityBySku(skuRaw: string, kind: SaleKind): {
+  ok: boolean;
+  reason?: string;
+  jogoId?: string;
+  contaId?: string;
+  state?: ReturnType<typeof _slotsState>;
+} {
+  const found = _findContaForKindBySku(skuRaw, kind);
+  if (!found) return { ok: false, reason: "Conta não encontrada para este SKU/mídia." };
+
+  const st = _slotsState(found.conta);
+  if (kind === "P_PS4" && !st.canPrimPS4) return { ok: false, reason: "Limite de primária PS4 atingido (2/2)." };
+  if (kind === "P_PS5" && !st.canPrimPS5) return { ok: false, reason: "Limite de primária PS5 atingido (2/2)." };
+  if (kind === "S_PS4" && !st.canSecPS4) {
+    const motivo = st.secSold
+      ? "Secundária já vendida."
+      : (!st.secUnlockedPS4 ? "Secundária PS4 ainda não desbloqueada (requer 2 primárias PS4)." : "Indisponível.");
+    return { ok: false, reason: motivo };
+  }
+  if (kind === "S_PS5" && !st.canSecPS5) {
+    const motivo = st.secSold
+      ? "Secundária já vendida."
+      : (!st.secUnlockedPS5 ? "Secundária PS5 ainda não desbloqueada (requer 2 primárias PS5)." : "Indisponível.");
+    return { ok: false, reason: motivo };
+  }
+
+  return { ok: true, jogoId: found.jogo.id, contaId: found.conta.id, state: st };
+}
+
+export function autoRegisterSaleBySku(skuRaw: string, kind: SaleKind): {
+  ok: boolean;
+  error?: string;
+  updated?: { jogo: Jogo; conta: ContaJogo };
+} {
+  const elig = checkSaleEligibilityBySku(skuRaw, kind);
+  if (!elig.ok || !elig.jogoId || !elig.contaId) {
+    return { ok: false, error: elig.reason || "Indisponível para venda." };
+  }
+  const res = _updateAccountPersist(elig.jogoId, elig.contaId, (c) => {
+    const next = { ...c };
+    if (kind === "P_PS4") next.sold_p_ps4 = Math.min(2, (next.sold_p_ps4 ?? 0) + 1);
+    if (kind === "P_PS5") next.sold_p_ps5 = Math.min(2, (next.sold_p_ps5 ?? 0) + 1);
+    if (kind === "S_PS4") { next.sold_s = true; next.sold_s_plat = "PS4"; }
+    if (kind === "S_PS5") { next.sold_s = true; next.sold_s_plat = "PS5"; }
+    return next;
+  });
+  if (!res.ok || !res.jogo || !res.conta) return { ok: false, error: "Falha ao persistir venda." };
+  return { ok: true, updated: { jogo: res.jogo, conta: res.conta } };
+}
+
+/* ========= NOVOS HELPERS P/ OUTRAS TELAS ========= */
+/** Consulta o estado atual (contadores e desbloqueios) por contaId */
+export function getSaleStateForConta(contaId: string) {
+  const lista = getJogosFromStorage();
+  for (const j of lista) {
+    const conta = (j.contas || []).find(c => c.id === contaId);
+    if (conta) {
+      const st = _slotsState(conta);
+      return { jogo: j, conta, state: st };
+    }
+  }
+  return null;
+}
+
+/** Retorna rapidamente o que dá pra vender por SKU (para escolher kind automaticamente) */
+export function getSaleAvailabilityBySku(skuRaw: string) {
+  const hits = findJogoBySku(skuRaw);
+  if (!hits) return null;
+  const { jogo } = hits;
+  const contaPrim = (jogo.contas || []).find(c => c.midia === "PRIMARIA");
+  const contaSec = (jogo.contas || []).find(c => c.midia === "SECUNDARIA");
+
+  const stP = contaPrim ? _slotsState(contaPrim) : null;
+  const stS = contaSec ? _slotsState(contaSec) : null;
+
+  return {
+    jogo,
+    prim: contaPrim ? { contaId: contaPrim.id, state: stP } : null,
+    sec: contaSec ? { contaId: contaSec.id, state: stS } : null,
+  };
 }

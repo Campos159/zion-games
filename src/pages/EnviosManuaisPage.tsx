@@ -2,13 +2,9 @@
 
 // src/pages/EnviosManuaisPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-// import { iniciarEnvio, type FulfillmentPayload } from "../services/fulfillment";
 import { enviarItemEmail } from "../services/email";
-
-// IMPORT ROBUSTO DO SERVICE DE JOGOS (com fallback em runtime)
 import * as JogosSvc from "../services/jogos";
 
-// Pedidos
 import {
   listarPedidos,
   listarItens,
@@ -16,6 +12,18 @@ import {
   type ItemRead,
   type Plataforma,
 } from "../services/pedidos";
+
+import {
+  autoenvioSubscribe,
+  autoenvioSnapshot,
+  autoenvioPause,
+  autoenvioResume,
+  autoenvioCancel,
+  autoenvioSendNow,
+  getAutoEnvio,
+  seedTimersFromPedidos, // <— novo export para semear
+  type AutoEnvioStatus,
+} from "../services/autoenvio";
 
 /* ================== Tipos e helpers ================== */
 type Variante = "PS4 Primária" | "PS4 Secundária" | "PS5 Primária" | "PS5 Secundária";
@@ -40,7 +48,6 @@ type ItemForm = {
   codigo: string;
 };
 
-// Tipos do service de jogos (do namespace)
 type JogoPorSku = JogosSvc.JogoPorSku;
 
 type Draft = {
@@ -60,7 +67,6 @@ function defaultVariantName(v: Variante): string {
   return v.includes("PS5") ? "PlayStation 5" : "PlayStation 4";
 }
 
-/** Sempre retorna a 2ª senha */
 function senha2(raw: string): string {
   if (!raw) return "";
   const s = String(raw).trim();
@@ -75,7 +81,6 @@ function clsx(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
 }
 
-/* ========== Telefone ========== */
 function onlyDigits(v: string) { return (v || "").replace(/\D+/g, ""); }
 function maskPhoneStrict(v: string) {
   const d = onlyDigits(v).slice(0, 11);
@@ -116,25 +121,37 @@ const platToVariante: Record<Plataforma, Variante> = {
   PS5s: "PS5 Secundária",
 };
 
-/* ======= n8n Webhook (mantido, não usado) ======= */
-const N8N_WEBHOOK_URL: string | undefined =
-  (typeof process !== "undefined" && (process as any)?.env?.REACT_APP_N8N_WEBHOOK_URL) ||
-  (typeof process !== "undefined" && (process as any)?.env?.VITE_N8N_WEBHOOK_URL) ||
-  (typeof window !== "undefined" && (window as any).__N8N_WEBHOOK_URL__) ||
-  undefined;
+/* ======= Backend base + marcar entregue ======= */
+function backendBaseUrl(): string {
+  const env = (typeof import.meta !== "undefined" ? (import.meta as any).env : {}) || {};
+  const base =
+    env?.VITE_BACKEND_BASE_URL ||
+    (typeof window !== "undefined" && (window as any).__BACKEND_BASE_URL__) ||
+    "";
+  return String(base || "").replace(/\/+$/, "");
+}
 
-async function postToWebhook(url: string, body: any) {
+async function marcarPedidoEntregue(orderId: string) {
+  const url = `${backendBaseUrl()}/yampi/mark-delivered`;
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ order_id: orderId }),
   });
   if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Webhook ${resp.status}: ${text || "falha ao enviar"}`);
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Falha ao marcar entregue (${resp.status}): ${t || "erro"}`);
   }
   return resp.json().catch(() => ({}));
 }
+
+/* ======= Autoenvio: helpers UI ======= */
+const fmtTime = (ms?: number) => {
+  const v = Math.max(0, Math.floor((ms ?? 0) / 1000));
+  const m = Math.floor(v / 60);
+  const s = v % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+};
 
 /* ================== Página ================== */
 export default function EnviosManuaisPage() {
@@ -142,7 +159,6 @@ export default function EnviosManuaisPage() {
   const [ok, setOk] = useState<null | boolean>(null);
   const [erro, setErro] = useState<string | null>(null);
 
-  // TOASTS
   const [toasts, setToasts] = useState<Toast[]>([]);
   const timeoutsRef = useRef<Record<string, number>>({});
   function showToast(type: ToastType, msg: string) {
@@ -170,45 +186,63 @@ export default function EnviosManuaisPage() {
   const [viaEmail, setViaEmail] = useState(true);
   const [autocompletarPorSku, setAutocompletarPorSku] = useState(true);
 
-  // status por item
   const [skuStatus, setSkuStatus] = useState<Record<number, SkuStatus>>({});
   const [skuErrorMsg, setSkuErrorMsg] = useState<Record<number, string>>({});
   const [skuDetected, setSkuDetected] = useState<Record<number, JogoPorSku | null>>({});
   const debounceTimers = useRef<Record<number, number>>({});
   const lastSearchedSku = useRef<Record<number, string>>({});
 
-  /* ---------- RASCUNHO: carregar ---------- */
+  /* ---------- RASCUNHO: carregar (tipado) ---------- */
   useEffect(() => {
     try {
       const raw = localStorage.getItem(DRAFT_KEY);
       if (!raw) return;
-      const d = JSON.parse(raw) as Draft;
-      setOrderId(d.orderId || "");
-      setItems(
-        (
-          d.items && d.items.length
-            ? d.items
-            : [
-                { itemId: undefined, sku: "", qty: 1, name: "", variant: "PS5 Primária", variant_name: "PlayStation 5", login: "", senhaRaw: "", codigo: "" },
-              ]
-        ).map((it) => ({
-          itemId: it.itemId,
-          sku: (it.sku || "").toUpperCase(),
-          qty: Number(it.qty || 1),
-          name: it.name || "",
-          variant: (it.variant as Variante) || "PS5 Primária",
-          variant_name: it.variant_name || defaultVariantName((it.variant as Variante) || "PS5 Primária"),
-          login: it.login || "",
-          senhaRaw: it.senhaRaw || "",
-          codigo: it.codigo || "",
-        }))
-      );
-      setNomeCliente(d.nomeCliente || "");
-      setEmail(d.email || "");
-      setPhoneMask(d.phone || "");
-      setViaWhatsapp(Boolean(d.viaWhatsapp));
-      setViaEmail(Boolean(d.viaEmail));
-      setAutocompletarPorSku(d.autocompletarPorSku ?? true);
+
+      const d = JSON.parse(raw) as Partial<Draft> | null;
+
+      const isVariante = (v: any): v is Variante =>
+        typeof v === "string" && (["PS4 Primária","PS4 Secundária","PS5 Primária","PS5 Secundária"] as const).includes(v as Variante);
+
+      const src: any[] =
+        Array.isArray(d?.items) && d!.items!.length
+          ? (d!.items as any[])
+          : [
+              {
+                itemId: undefined,
+                sku: "",
+                qty: 1,
+                name: "",
+                variant: "PS5 Primária",
+                variant_name: "PlayStation 5",
+                login: "",
+                senhaRaw: "",
+                codigo: "",
+              },
+            ];
+
+      const restoredItems: ItemForm[] = src.map((row: any): ItemForm => {
+        const variant: Variante = isVariante(row?.variant) ? row.variant : "PS5 Primária";
+        return {
+          itemId: typeof row?.itemId === "number" ? row.itemId : undefined,
+          sku: String(row?.sku ?? "").toUpperCase(),
+          qty: Number(row?.qty ?? 1),
+          name: String(row?.name ?? ""),
+          variant,
+          variant_name: String(row?.variant_name ?? defaultVariantName(variant)),
+          login: String(row?.login ?? ""),
+          senhaRaw: String(row?.senhaRaw ?? ""),
+          codigo: String(row?.codigo ?? ""),
+        };
+      });
+
+      setOrderId(String(d?.orderId ?? ""));
+      setItems(restoredItems);
+      setNomeCliente(String(d?.nomeCliente ?? ""));
+      setEmail(String(d?.email ?? ""));
+      setPhoneMask(String(d?.phone ?? ""));
+      setViaWhatsapp(Boolean(d?.viaWhatsapp));
+      setViaEmail(Boolean(d?.viaEmail));
+      setAutocompletarPorSku(d?.autocompletarPorSku ?? true);
     } catch {
       showToast("error", "Falha ao carregar rascunho do navegador.");
     }
@@ -356,7 +390,6 @@ export default function EnviosManuaisPage() {
       setSkuStatus((s) => ({ ...s, [ix]: "success" }));
       showToast("success", `SKU carregado: ${sku}`);
     } catch (e: any) {
-      console.error("Erro SKU", e);
       setSkuStatus((s) => ({ ...s, [ix]: "error" }));
       setSkuErrorMsg((s) => ({ ...s, [ix]: e?.message || "Falha ao buscar SKU" }));
       setSkuDetected((s) => ({ ...s, [ix]: null }));
@@ -394,12 +427,53 @@ export default function EnviosManuaisPage() {
   const [busca, setBusca] = useState("");
   const [somentePagos, setSomentePagos] = useState(true);
 
+  const [autoRows, setAutoRows] = useState<Record<number, { status: AutoEnvioStatus; remainingMs: number }>>({});
+
+  // Snapshot inicial + subscribe estável
+  useEffect(() => {
+    // garante engine on
+    try { (getAutoEnvio() as any).start?.(); } catch {}
+
+    const snap = autoenvioSnapshot();
+    const nowTs = Date.now();
+    const m: Record<number, { status: AutoEnvioStatus; remainingMs: number }> = {};
+    for (const [idStr, t] of Object.entries(snap)) {
+      const id = Number(idStr);
+      m[id] = {
+        status: (t as any).status,
+        remainingMs: (t as any).status === "running" ? Math.max(0, (t as any).targetAt - nowTs) : (t as any).remainingMs,
+      };
+    }
+    setAutoRows(m);
+
+    const callbacks = {
+      onStatus: ({ pedidoId, status, remainingMs }: any) => {
+        setAutoRows((prev) => ({ ...prev, [pedidoId]: { status, remainingMs: remainingMs ?? 0 } }));
+      },
+      onToast: ({ type, msg }: any) => {
+        showToast(type, msg);
+      },
+      onLog: (line: string) => {
+        // útil para depuração
+        console.debug(line);
+      }
+    };
+    autoenvioSubscribe(callbacks);
+
+    return () => {
+      autoenvioSubscribe({}); // limpa callbacks ao desmontar
+    };
+  }, []);
+
+  // Carrega pedidos e semeia timers (front UI + engine)
   useEffect(() => {
     (async () => {
       try {
         setCarregaPedidos(true);
         const data = await listarPedidos();
         setPedidos(data);
+        // semear timers para 5 minutos após criação (se passou, envia já)
+        seedTimersFromPedidos(data);
       } finally {
         setCarregaPedidos(false);
       }
@@ -526,7 +600,7 @@ export default function EnviosManuaisPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [skusSignature]);
 
-  /* ---------- Enviar ---------- */
+  /* ---------- Enviar Manual (botão) ---------- */
   async function onEnviar() {
     setLoading(true);
     setOk(null);
@@ -560,20 +634,13 @@ export default function EnviosManuaisPage() {
           try {
             const midia = midiaFromVariant(it.variant);
             const consumo = await (JogosSvc as any).consumirCodigoPorSkuEMidia(it.sku, midia);
-            const codigoConsumido = consumo?.codigo;
+            const codigoConsumido = (consumo && typeof consumo === "object" ? (consumo as any).codigo : "") as string;
             setItems((prev) =>
               prev.map((x, ix) =>
                 ix === i ? { ...x, codigo: codigoConsumido || x.codigo } : x
               )
             );
-            showToast(
-              codigoConsumido ? "info" : "error",
-              codigoConsumido
-                ? `Código consumido para ${it.sku}: ${codigoConsumido}`
-                : `Nenhum código disponível para consumo em ${it.sku}`
-            );
           } catch (consErr) {
-            console.error("Falha ao consumir o código:", consErr);
             showToast("error", "Falha ao consumir o código após o envio.");
           }
         } catch (e: any) {
@@ -585,6 +652,26 @@ export default function EnviosManuaisPage() {
       setOk(true);
       setErro(null);
       showToast("success", "Todos os e-mails foram enfileirados e códigos consumidos ✅");
+
+      // Marcar entregue + cancelar timer do autoenvio
+      try {
+        const code = String(orderId || (pedidoAtual?.codigo ?? pedidoAtual?.id) || "").trim();
+        if (code) {
+          await marcarPedidoEntregue(code);
+          showToast("success", `Pedido ${code} marcado como ENTREGUE na Yampi ✅`);
+          setPedidos((prev) =>
+            prev.map((p) => {
+              const same = String(p.codigo || p.id) === String(code);
+              if (!same) return p;
+              return { ...p, enviado: true, enviado_em: new Date().toISOString() } as PedidoRead;
+            })
+          );
+          const alvo = pedidos.find((p) => String(p.codigo || p.id) === code);
+          if (alvo?.id) autoenvioCancel(alvo.id);
+        }
+      } catch (e: any) {
+        showToast("error", e?.message || "Falha ao marcar pedido como entregue na Yampi");
+      }
     } catch (e: any) {
       const msg = e?.message || "Erro inesperado ao enviar os e-mails";
       setOk(false);
@@ -596,9 +683,17 @@ export default function EnviosManuaisPage() {
   }
 
   /* ================== UI ================== */
+  const fmtPill = (st?: AutoEnvioStatus) =>
+    st === "running" ? "bg-indigo-100 text-indigo-800 border-indigo-200" :
+    st === "paused" ? "bg-amber-100 text-amber-800 border-amber-200" :
+    st === "processing" ? "bg-blue-100 text-blue-800 border-blue-200" :
+    st === "sent" ? "bg-emerald-100 text-emerald-800 border-emerald-200" :
+    st === "cancelled" ? "bg-slate-100 text-slate-800 border-slate-200" :
+    "bg-slate-100 text-slate-800 border-slate-200";
+
   return (
     <div className="px-4 py-5 sm:p-6 max-w-7xl mx-auto">
-      {/* TOASTS (centraliza no mobile) */}
+      {/* TOASTS */}
       <div className="fixed top-4 left-4 right-4 sm:left-auto sm:right-4 z-50 space-y-2 sm:w-auto sm:max-w-sm">
         {toasts.map((t) => (
           <div
@@ -620,19 +715,11 @@ export default function EnviosManuaisPage() {
         <h1 className="text-xl sm:text-2xl font-bold">Envios Manuais</h1>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={autocompletarPorSku}
-              onChange={(e) => setAutocompletarPorSku(e.target.checked)}
-            />
+            <input type="checkbox" checked={autocompletarPorSku} onChange={(e) => setAutocompletarPorSku(e.target.checked)} />
             Autocompletar por SKU
           </label>
           <label className="inline-flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={somentePagos}
-              onChange={(e) => setSomentePagos(e.target.checked)}
-            />
+            <input type="checkbox" checked={somentePagos} onChange={(e) => setSomentePagos(e.target.checked)} />
             Mostrar só pagos
           </label>
           <div className="flex flex-wrap gap-2">
@@ -664,7 +751,6 @@ export default function EnviosManuaisPage() {
               className="px-3 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm"
               onClick={limparRascunho}
               type="button"
-              title="Limpar rascunho local"
             >
               Limpar
             </button>
@@ -692,33 +778,84 @@ export default function EnviosManuaisPage() {
             />
 
             <div className="space-y-2 max-h-[45vh] sm:max-h-[540px] overflow-auto pr-1">
-              {pedidosOrdenados.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => carregarPedidoNaTela(p)}
-                  className="w-full text-left p-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition"
-                  title="Carregar este pedido no formulário de envio"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="font-semibold text-sm truncate">{p.cliente_nome}</div>
-                    <span
-                      className={clsx(
-                        "text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border shrink-0",
-                        isPago(p.status)
-                          ? "bg-emerald-100 text-emerald-800 border-emerald-200"
-                          : "bg-amber-100 text-amber-800 border-amber-200"
-                      )}
-                    >
-                      {p.status}
-                    </span>
+              {pedidosOrdenados.map((p) => {
+                const auto = autoRows[p.id];
+                return (
+                  <div key={p.id} className="p-3 rounded-xl border border-white/10 bg-white/5">
+                    <div className="flex items-start justify-between gap-2">
+                      <button
+                        onClick={() => carregarPedidoNaTela(p)}
+                        className="text-left flex-1 hover:opacity-90"
+                        title="Carregar este pedido no formulário de envio"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="font-semibold text-sm truncate">{p.cliente_nome}</div>
+                          <span
+                            className={clsx(
+                              "text-[10px] uppercase tracking-wide rounded-full px-2 py-0.5 border shrink-0",
+                              /pago|paid/i.test(String(p.status || ""))
+                                ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                                : "bg-amber-100 text-amber-800 border-amber-200"
+                            )}
+                          >
+                            {p.status}
+                          </span>
+                        </div>
+                        <div className="text-xs opacity-90">
+                          <b>Data:</b> {p.data_criacao} • <b>Cód:</b> {p.codigo || p.id}
+                        </div>
+                        <div className="text-xs opacity-80 truncate">{p.cliente_email}</div>
+                        <div className="text-xs opacity-60">{p.telefone || "—"}</div>
+                      </button>
+
+                      {/* Autoenvio status + ações */}
+                      <div className="w-[150px] text-right">
+                        <div className={clsx("text-[10px] inline-block rounded-full px-2 py-0.5 border", fmtPill(auto?.status))}>
+                          {auto?.status || "—"}
+                        </div>
+                        {auto?.status === "running" && (
+                          <div className="text-[11px] mt-0.5 opacity-80">em {fmtTime(auto.remainingMs)}</div>
+                        )}
+                        <div className="flex gap-1 mt-2 justify-end">
+                          {auto?.status === "running" && (
+                            <button
+                              className="px-2 py-1 rounded bg-amber-600 text-white text-[11px]"
+                              onClick={() => autoenvioPause(p.id)}
+                              title="Pausar"
+                            >
+                              Pause
+                            </button>
+                          )}
+                          {auto?.status === "paused" && (
+                            <button
+                              className="px-2 py-1 rounded bg-emerald-600 text-white text-[11px]"
+                              onClick={() => autoenvioResume(p.id)}
+                              title="Retomar"
+                            >
+                              Retomar
+                            </button>
+                          )}
+                          <button
+                            className="px-2 py-1 rounded bg-blue-600 text-white text-[11px]"
+                            onClick={() => autoenvioSendNow(p.id)}
+                            title="Enviar agora"
+                            disabled={auto?.status === "processing"}
+                          >
+                            Enviar
+                          </button>
+                          <button
+                            className="px-2 py-1 rounded bg-rose-600 text-white text-[11px]"
+                            onClick={() => autoenvioCancel(p.id)}
+                            title="Cancelar autoenvio"
+                          >
+                            X
+                          </button>
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-xs opacity-90">
-                    <b>Data:</b> {p.data_criacao} • <b>Cód:</b> {p.codigo || p.id}
-                  </div>
-                  <div className="text-xs opacity-80 truncate">{p.cliente_email}</div>
-                  <div className="text-xs opacity-60">{p.telefone || "—"}</div>
-                </button>
-              ))}
+                );
+              })}
               {!carregaPedidos && pedidosOrdenados.length === 0 && (
                 <div className="text-sm opacity-70">Nenhum pedido pendente.</div>
               )}
@@ -754,7 +891,7 @@ export default function EnviosManuaisPage() {
                   const err = skuErrorMsg[ix] || "";
                   return (
                     <div key={ix} className="p-3 rounded-xl bg-white/5 border border-white/10 mb-3">
-                      {/* VARIAÇÃO por item (rolável no mobile) */}
+                      {/* VARIAÇÃO por item */}
                       <div className="mb-2">
                         <div className="text-xs mb-1 opacity-90">Variação do item</div>
                         <div className="relative -mx-1">
@@ -833,11 +970,7 @@ export default function EnviosManuaisPage() {
                       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-3">
                         <div>
                           <label className="text-sm">Login</label>
-                          <input
-                            className="w-full input"
-                            value={it.login}
-                            onChange={(e) => updateItem(ix, { login: e.target.value })}
-                          />
+                          <input className="w-full input" value={it.login} onChange={(e) => updateItem(ix, { login: e.target.value })} />
                         </div>
                         <div>
                           <label className="text-sm">Senha (usaremos a 2ª)</label>
@@ -879,11 +1012,7 @@ export default function EnviosManuaisPage() {
 
                       {items.length > 1 && (
                         <div className="mt-3 text-right">
-                          <button
-                            type="button"
-                            className="px-3 py-1 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm"
-                            onClick={() => removeItem(ix)}
-                          >
+                          <button type="button" className="px-3 py-1 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm" onClick={() => removeItem(ix)}>
                             Remover item
                           </button>
                         </div>
@@ -945,7 +1074,6 @@ export default function EnviosManuaisPage() {
         </div>
       </div>
 
-      {/* estilo mínimo para inputs + no-scrollbar util */}
       <style>{`
         .input {
           background: rgba(99, 102, 241, 0.10);
@@ -966,4 +1094,3 @@ export default function EnviosManuaisPage() {
     </div>
   );
 }
-
